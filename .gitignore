@@ -1,10 +1,11 @@
 .vscode/
+.idea/
 operator/logs/
 
 # Inside the simulator folder the compiled version of the UE4Project will be placed which shouldn't be committed.
 simulator/
 !simulator/readme.md
-
+AirSim/
 # compiled mkdocs html
 site
 
