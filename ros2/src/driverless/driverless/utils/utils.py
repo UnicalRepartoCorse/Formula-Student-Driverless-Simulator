@@ -39,3 +39,19 @@ def angle_diff(a, b):
     """
     d = a - b
     return (d + math.pi) % (2.0 * math.pi) - math.pi
+
+def normalize_angle(angle):
+    """
+    Normalize an angle to the range [-π, π).
+
+    This function takes an input angle and adjusts it to be within
+    the standard range of -π (inclusive) to π (exclusive). It ensures
+    that angles are represented in a consistent format, which can be
+    useful for computations in geometry, physics, and engineering.
+
+    :param angle: The angle in radians to normalize.
+    :type angle: float
+    :return: The normalized angle in radians within the range [-π, π).
+    :rtype: float
+    """
+    return (angle + math.pi) % (2*math.pi) - math.pi

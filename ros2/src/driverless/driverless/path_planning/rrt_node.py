@@ -10,7 +10,9 @@ from builtin_interfaces.msg import Duration
 
 from nav_msgs.msg import Path, Odometry
 from driverless.utils.collision_checker import CollisionChecker
+from driverless.utils.utils import normalize_angle
 from .rrt_star import KinematicRRTStar
+from .rrt_star import Node as RRTNodeState
 
 class RRTNode(Node):
     """
@@ -27,9 +29,10 @@ class RRTNode(Node):
         self.declare_parameter('collision_strategy', 'radial')
         self.declare_parameter('max_steering_angle', math.radians(24)) # rad
         self.declare_parameter('wheelbase', 1.58) # m
-        self.declare_parameter('step_size', 1) # m
-        self.declare_parameter('sample_radius_centerline', 1.5)
-        self.declare_parameter('max_iter', 500)
+        self.declare_parameter('step_size', 0.3) # m
+        self.declare_parameter('sample_radius_centerline', 1.4)
+        self.declare_parameter('max_iter', 700)
+        self.declare_parameter('num_trees', 3)
         self.declare_parameter('centerline_topic', '/track/centerline')
         self.declare_parameter('cones_topic', '/fsds/testing_only/track')
 
@@ -52,7 +55,7 @@ class RRTNode(Node):
         self.n_blue_at_last_plan:   int = 0
         self.n_yellow_at_last_plan: int = 0
         # Soglia: quanti NUOVI coni per lato triggherano un replan
-        self.NEW_CONE_THRESHOLD: int = 2
+        self.NEW_CONE_THRESHOLD: int = 0
         # Ultimo punto del path precedente in frame GLOBALE (gx, gy, gtheta)
         self.last_goal_global = None
         # Ultima goal line calcolata in coordinate GLOBALI ((gx1, gy1), (gx2, gy2))
@@ -98,7 +101,7 @@ class RRTNode(Node):
         self.timer = self.create_timer(0.1, self.plan_timer_callback) # 10 Hz
 
         # Initialize the collision checker
-        self.collision_checker = CollisionChecker(strategy=collision_strategy, cone_radius=0.3)
+        self.collision_checker = CollisionChecker(strategy=collision_strategy,cone_radius=0.3)
 
         self.get_logger().info(f"RRT* Node Initialized. Subscribed to {cones_topic} with strategy {collision_strategy}")
 
@@ -106,7 +109,7 @@ class RRTNode(Node):
         """
         Callback triggered when a new centerline is received.
         """
-        self.centerline = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        self.centerline = [RRTNodeState(p.pose.position.x, p.pose.position.y, 0) for p in msg.poses]
         #self.get_logger().info(f"Received centerline with {len(self.centerline)} points.")
 
     def odom_callback(self, msg: Odometry):
@@ -140,7 +143,7 @@ class RRTNode(Node):
         for c in msg.track:
             gx, gy = c.location.x, c.location.y
             dist = math.hypot(gx - self.car_x, gy - self.car_y)
-            if dist < 15.0:  # local horizon filter (30m)
+            if dist < 5.0:
                 dx = gx - self.car_x
                 dy = gy - self.car_y
                 lx = dx * math.cos(self.car_yaw) + dy * math.sin(self.car_yaw)
@@ -158,8 +161,21 @@ class RRTNode(Node):
                     local_orange_cones.append(pos_local)
                     global_orange_cones.append(pos_global)
 
-        self.collision_checker.update_cones(local_blue_cones, local_yellow_cones, local_orange_cones)
-        #self.get_logger().info(f"Received track with {len(msg.track)} cones. Local cones within 30m: blue={len(local_blue_cones)}, yellow={len(local_yellow_cones)}")
+        # Esegui l'update dei coni e ricevi i contorni calcolati in frame locale
+        blue_boundary_local, yellow_boundary_local = self.collision_checker.update_cones(
+            local_blue_cones, local_yellow_cones, local_orange_cones
+        )
+
+        # Converti i contorni in coordinate globali per la visualizzazione su RViz
+        if blue_boundary_local is not None and len(blue_boundary_local) > 0:
+            self.last_blue_boundary = [self.to_global(p[0], p[1]) for p in blue_boundary_local]
+        else:
+            self.last_blue_boundary = []
+
+        if yellow_boundary_local is not None and len(yellow_boundary_local) > 0:
+            self.last_yellow_boundary = [self.to_global(p[0], p[1]) for p in yellow_boundary_local]
+        else:
+            self.last_yellow_boundary = []
 
         # Collect all coordinates for bounds calculation
         all_local_cones = local_blue_cones + local_yellow_cones + local_orange_cones
@@ -196,12 +212,12 @@ class RRTNode(Node):
         # 3. Centerline in frame locale
         local_centerline = []
         if self.centerline:
-            for cx, cy in self.centerline:
-                dx = cx - self.car_x
-                dy = cy - self.car_y
+            for node in self.centerline:
+                dx = node.x - self.car_x
+                dy = node.y - self.car_y
                 lx =  dx * math.cos(self.car_yaw) + dy * math.sin(self.car_yaw)
                 ly = -dx * math.sin(self.car_yaw) + dy * math.cos(self.car_yaw)
-                local_centerline.append((lx, ly))
+                local_centerline.append(RRTNodeState(lx, ly,0))
 
         # 4. Goal line in frame locale
         goal_line = None
@@ -209,13 +225,13 @@ class RRTNode(Node):
         if local_centerline and len(local_centerline) > 1:
             p1 = local_centerline[-2]
             p2 = local_centerline[-1]
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
+            dx = p2.x - p1.x
+            dy = p2.y - p1.y
             length = math.hypot(dx, dy)
             if length > 0:
                 nx = -dy / length * 2.0
                 ny =  dx / length * 2.0
-                goal_line = ((p2[0] + nx, p2[1] + ny), (p2[0] - nx, p2[1] - ny))
+                goal_line = ((p2.x + nx, p2.y + ny), (p2.x - nx, p2.y - ny))
 
         if goal_line is None and local_blue_cones and local_yellow_cones:
             last_blue   = max(local_blue_cones,   key=lambda c: c[0])
@@ -238,20 +254,19 @@ class RRTNode(Node):
 
         # 5. Start del nuovo RRT: prendiamo il 4° punto dalla fine del path precedente (se disponibile)
         #    per garantire una transizione liscia, altrimenti partiamo dall'origine (posizione auto).
-        rrt_start = None
-        overlap_count = 0
 
-        if self.last_path_global_states and len(self.last_path_global_states) >= 4:
-            start_state_global = self.last_path_global_states[-4]
+        last_point = 4
+        if self.last_path_global_states and len(self.last_path_global_states) >=last_point:
+            start_state_global = self.last_path_global_states[-last_point]
             lgx, lgy, lgtheta = start_state_global
             dx  = lgx - self.car_x
             dy  = lgy - self.car_y
             slx =  dx * math.cos(self.car_yaw) + dy * math.sin(self.car_yaw)
             sly = -dx * math.sin(self.car_yaw) + dy * math.cos(self.car_yaw)
             stheta = lgtheta - self.car_yaw
-            stheta = (stheta + math.pi) % (2 * math.pi) - math.pi
+            stheta = normalize_angle(stheta)
             rrt_start = (slx, sly, stheta)
-            overlap_count = 4  # Rimuoveremo gli ultimi 4 punti per agganciarci al 5°
+            overlap_count = last_point  # Rimuoveremo gli ultimi 4 punti per agganciarci al 5°
         elif self.last_goal_global is not None:
             lgx, lgy, lgtheta = self.last_goal_global
             dx  = lgx - self.car_x
@@ -271,21 +286,38 @@ class RRTNode(Node):
         bounds = (min(lx_coords) - padding, max(lx_coords) + padding,
                   min(ly_coords) - padding, max(ly_coords) + padding)
 
-        # 7. Run RRT* dal punto di estensione
-        rrt = KinematicRRTStar(
-            start=rrt_start,
-            goal_line=goal_line,
-            bounds=bounds,
-            collision_checker=self.collision_checker,
-            max_steering_angle=self.get_parameter('max_steering_angle').value,
-            wheelbase=self.get_parameter('wheelbase').value,
-            step_size=self.get_parameter('step_size').value,
-            max_iter=self.get_parameter('max_iter').value,
-            sample_radius_centerline=self.get_parameter('sample_radius_centerline').value,
-            centerline=local_centerline if local_centerline else None
-        )
+        # Calcolo dei target per il campionamento (target-biased)
+        rrt_targets = []
+        cone_obstacle_size = 1.1  # raggio/dimensione ostacolo del cono
+        for lx, ly in local_blue_cones + local_yellow_cones:
+            if lx > 1.5:  # considera solo coni davanti al veicolo
+                rrt_targets.append((lx, ly, cone_obstacle_size))
 
-        new_path_local = rrt.plan()
+        trees = []
+        for i in range(self.get_parameter('num_trees').value):
+            # 7. Run RRT* dal punto di estensione
+            rrt = KinematicRRTStar(
+                start=rrt_start,
+                goal_line=goal_line,
+                bounds=bounds,
+                collision_checker=self.collision_checker,
+                max_steering_angle=self.get_parameter('max_steering_angle').value,
+                wheelbase=self.get_parameter('wheelbase').value,
+                step_size=self.get_parameter('step_size').value,
+                max_iter=self.get_parameter('max_iter').value,
+                sample_radius_centerline=self.get_parameter('sample_radius_centerline').value,
+                centerline=local_centerline if local_centerline else None,
+                rrt_targets=None # rrt_targets
+            )
+            res = rrt.plan()
+            if res is not None:
+                new_path_local, path_cost = res
+                trees.append((new_path_local, path_cost))
+
+        if trees:
+            new_path_local, path_cost = min(trees, key=lambda x: x[1])
+        else:
+            new_path_local = None
 
         if new_path_local is not None:
             # Converti nuovo path in frame globale
@@ -295,7 +327,7 @@ class RRTNode(Node):
             self._trim_published_path()
 
             # Rimuovi gli ultimi 3 elementi sovrapposti per collegare correttamente il nuovo percorso
-            if overlap_count > 0 and len(self.published_path_global) >= overlap_count:
+            if 0 < overlap_count <= len(self.published_path_global):
                 self.published_path_global = self.published_path_global[:-overlap_count]
 
             self.published_path_global.extend(new_path_global)
@@ -304,7 +336,7 @@ class RRTNode(Node):
             last_local = new_path_local[-1]
             lgx, lgy   = self.to_global(last_local[0], last_local[1])
             lgtheta    = last_local[2] + self.car_yaw
-            lgtheta    = (lgtheta + math.pi) % (2 * math.pi) - math.pi
+            lgtheta    = normalize_angle(lgtheta)
             self.last_goal_global = (lgx, lgy, lgtheta)
 
             # Salva tutti i nuovi stati globali per il prossimo replan
@@ -312,19 +344,19 @@ class RRTNode(Node):
             for p in new_path_local:
                 gx, gy = self.to_global(p[0], p[1])
                 gtheta = p[2] + self.car_yaw
-                gtheta = (gtheta + math.pi) % (2 * math.pi) - math.pi
+                gtheta = normalize_angle(gtheta)
                 self.last_path_global_states.append((gx, gy, gtheta))
 
             # Aggiorna soglia coni
             self.n_blue_at_last_plan   = len(self.seen_blue_keys)
             self.n_yellow_at_last_plan = len(self.seen_yellow_keys)
 
-            self.get_logger().info(
-                f"Replan OK: +{new_blue} blue, +{new_yellow} yellow | "
-                f"path={len(self.published_path_global)} pts"
-            )
-        else:
-            self.get_logger().warn("RRT* replan failed — keeping old path")
+       #    self.get_logger().info(
+       #        f"Replan OK: +{new_blue} blue, +{new_yellow} yellow | "
+       #        f"path={len(self.published_path_global)} pts"
+       #    )
+       #else:
+       #    self.get_logger().warn("RRT* replan failed — keeping old path")
 
         # 8. Pubblica e visualizza
         self.publish_path(self.published_path_global)
@@ -357,7 +389,7 @@ class RRTNode(Node):
         """
         marker_array = MarkerArray()
         now = self.get_clock().now().to_msg()
-        lifetime_msg = Duration(sec=4, nanosec=500000000) # Aumentato a 1.5s per eliminare lo sfarfallio
+        lifetime_msg = Duration(sec=400, nanosec=50) # Aumentato a 1.5s per eliminare lo sfarfallio
 
         # 1. Tree Marker (Line List)
         tree_marker = Marker()
@@ -367,11 +399,12 @@ class RRTNode(Node):
         tree_marker.id = 0
         tree_marker.type = Marker.LINE_LIST
         tree_marker.action = Marker.ADD
+        tree_marker.pose.orientation.w = 1.0
         tree_marker.scale.x = 0.02 # Line width
-        tree_marker.color.r = 0.5
-        tree_marker.color.g = 0.5
-        tree_marker.color.b = 0.5
-        tree_marker.color.a = 0.8 # Semi-transparent
+        tree_marker.color.r = 0.6
+        tree_marker.color.g = 0.1
+        tree_marker.color.b = 0.8
+        tree_marker.color.a = 0.6 # Semi-transparent purple
         tree_marker.lifetime = lifetime_msg
 
         for node in nodes:
@@ -394,12 +427,13 @@ class RRTNode(Node):
             tree_nodes_marker.id = 15
             tree_nodes_marker.type = Marker.POINTS
             tree_nodes_marker.action = Marker.ADD
+            tree_nodes_marker.pose.orientation.w = 1.0
             tree_nodes_marker.scale.x = 0.12  # Aumentato da 0.05 a 0.12 per visibilità
             tree_nodes_marker.scale.y = 0.12
-            tree_nodes_marker.color.r = 0.2
-            tree_nodes_marker.color.g = 0.6
-            tree_nodes_marker.color.b = 1.0  # Bright light blue
-            tree_nodes_marker.color.a = 0.8
+            tree_nodes_marker.color.r = 0.6
+            tree_nodes_marker.color.g = 0.1
+            tree_nodes_marker.color.b = 0.8  # Purple
+            tree_nodes_marker.color.a = 0.2
             tree_nodes_marker.lifetime = lifetime_msg
 
             for node in nodes:
@@ -417,12 +451,13 @@ class RRTNode(Node):
             samples_marker.id = 20
             samples_marker.type = Marker.POINTS
             samples_marker.action = Marker.ADD
+            samples_marker.pose.orientation.w = 1.0
             samples_marker.scale.x = 0.15  # Aumentato da 0.03 a 0.08 per visibilità
             samples_marker.scale.y = 0.08
             samples_marker.color.r = 1.0
             samples_marker.color.g = 0.4
             samples_marker.color.b = 0.0  # Orange
-            samples_marker.color.a = 0.75  # Semi-transparent to avoid clutter
+            samples_marker.color.a = 0.2  # Semi-transparent to avoid clutter
             samples_marker.lifetime = lifetime_msg
 
             for sx, sy in samples:
@@ -440,6 +475,7 @@ class RRTNode(Node):
             path_marker.id = 1
             path_marker.type = Marker.LINE_STRIP
             path_marker.action = Marker.ADD
+            path_marker.pose.orientation.w = 1.0
             path_marker.scale.x = 0.1 # Line width
             path_marker.color.r = 0.0
             path_marker.color.g = 1.0
@@ -460,12 +496,13 @@ class RRTNode(Node):
             path_points_marker.id = 10
             path_points_marker.type = Marker.SPHERE_LIST
             path_points_marker.action = Marker.ADD
+            path_points_marker.pose.orientation.w = 1.0
             path_points_marker.scale.x = 0.15  # Sphere diameter X
             path_points_marker.scale.y = 0.15  # Sphere diameter Y
             path_points_marker.scale.z = 0.15  # Sphere diameter Z
-            path_points_marker.color.r = 0.0
-            path_points_marker.color.g = 0.8
-            path_points_marker.color.b = 0.8  # Cyan/teal color to stand out
+            path_points_marker.color.r = 1.0
+            path_points_marker.color.g = 0.0
+            path_points_marker.color.b = 0.0  # Red
             path_points_marker.color.a = 1.0
             path_points_marker.lifetime = lifetime_msg
 
@@ -483,6 +520,7 @@ class RRTNode(Node):
         if goal is not None:
             goal_marker.type = Marker.LINE_STRIP
             goal_marker.action = Marker.ADD
+            goal_marker.pose.orientation.w = 1.0
             goal_marker.scale.x = 0.1
             goal_marker.color.r = 1.0
             goal_marker.color.g = 0.0
@@ -504,6 +542,7 @@ class RRTNode(Node):
             cl_marker.id = 3
             cl_marker.type = Marker.LINE_STRIP
             cl_marker.action = Marker.ADD
+            cl_marker.pose.orientation.w = 1.0
             cl_marker.scale.x = 0.05 # Slightly thinner than the RRT path
             cl_marker.color.r = 1.0
             cl_marker.color.g = 0.0
@@ -512,9 +551,53 @@ class RRTNode(Node):
             cl_marker.lifetime = lifetime_msg
 
             for p in self.centerline:
-                cl_marker.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+                cl_marker.points.append(Point(x=float(p.x), y=float(p.y), z=0.0))
 
             marker_array.markers.append(cl_marker)
+
+        # 4b. Blue Boundary Marker (Line Strip, Blue)
+        if hasattr(self, 'last_blue_boundary') and self.last_blue_boundary:
+            blue_b_marker = Marker()
+            blue_b_marker.header.frame_id = "fsds/map"
+            blue_b_marker.header.stamp = now
+            blue_b_marker.ns = "blue_boundary"
+            blue_b_marker.id = 50
+            blue_b_marker.type = Marker.LINE_STRIP
+            blue_b_marker.action = Marker.ADD
+            blue_b_marker.pose.orientation.w = 1.0
+            blue_b_marker.scale.x = 0.05
+            blue_b_marker.color.r = 0.0
+            blue_b_marker.color.g = 0.4
+            blue_b_marker.color.b = 1.0 # Nice bright blue
+            blue_b_marker.color.a = 0.8
+            blue_b_marker.lifetime = lifetime_msg
+
+            for p in self.last_blue_boundary:
+                blue_b_marker.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+
+            marker_array.markers.append(blue_b_marker)
+
+        # 4c. Yellow Boundary Marker (Line Strip, Yellow)
+        if hasattr(self, 'last_yellow_boundary') and self.last_yellow_boundary:
+            yellow_b_marker = Marker()
+            yellow_b_marker.header.frame_id = "fsds/map"
+            yellow_b_marker.header.stamp = now
+            yellow_b_marker.ns = "yellow_boundary"
+            yellow_b_marker.id = 51
+            yellow_b_marker.type = Marker.LINE_STRIP
+            yellow_b_marker.action = Marker.ADD
+            yellow_b_marker.pose.orientation.w = 1.0
+            yellow_b_marker.scale.x = 0.05
+            yellow_b_marker.color.r = 1.0
+            yellow_b_marker.color.g = 0.8
+            yellow_b_marker.color.b = 0.0 # Nice bright yellow
+            yellow_b_marker.color.a = 0.8
+            yellow_b_marker.lifetime = lifetime_msg
+
+            for p in self.last_yellow_boundary:
+                yellow_b_marker.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+
+            marker_array.markers.append(yellow_b_marker)
 
         # 5. Cones Markers (CUBE_LIST for efficiency)
         def add_cones_marker(cones, marker_id, r, g, b):
@@ -527,6 +610,7 @@ class RRTNode(Node):
             m.id = marker_id
             m.type = Marker.CUBE_LIST
             m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
             m.scale.x = 0.2
             m.scale.y = 0.2
             m.scale.z = 0.3
