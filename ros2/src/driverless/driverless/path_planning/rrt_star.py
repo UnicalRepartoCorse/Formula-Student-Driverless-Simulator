@@ -5,6 +5,15 @@ from typing import List, Tuple, Optional
 from driverless.utils.collision_checker import CollisionChecker
 from driverless.utils.utils import normalize_angle
 
+'''
+The state of a the car in a 2-D Cartesian coordinates is defined as S = (x, y, θ), and the kinematic model is described by
+the following equation
+    - x = v · cos φ · cos θ
+    - y = v · cos φ · sin θ
+    - θ = v · sin φ/l
+where v is the driving velocity of the rear wheels, θ is the orientation angle of the robot body with respect to the X-axis, φ is the steering angle of the front wheels, and l is the wheelbase
+Turning radius ρ ≥ ρmin = l/ tan φmax
+'''
 
 class Node:
     """
@@ -16,9 +25,10 @@ class Node:
         self.theta = theta
         self.cost = 0.0
         self.parent = None
+        self.children = []   # lista di nodi figli per propagazione costi efficiente
         #storing dist to goal for efficiency
         self.dist_to_goal = inf
-        # Store the path of (x, y) coordinates from the parent to this node
+        # Store the path of (x, y, theta) coordinates from the parent to this node
         self.path = []
 
 class KinematicRRTStar:
@@ -119,12 +129,12 @@ class KinematicRRTStar:
 
         return dist_seg
 
-    def plan(self) -> Optional[List[Tuple[float, float, float]]]:
+    def plan(self) -> Optional[Tuple[List[Tuple[float, float, float]], float]]:
         """
         Execute the RRT* planning algorithm.
         
         Returns:
-            List of (x, y, theta) representing the path, or None if no path found.
+            Tuple of (path, cost) where path is a list of (x, y, theta), or None if no path found.
         """
         for i in range(0, self.max_iter):
 
@@ -152,6 +162,10 @@ class KinematicRRTStar:
             new_node = self._choose_parent(new_node, nearest_indeces) #update parent, cost and path of the new node
 
             self.node_list.append(new_node)
+
+            # Register as child of parent for efficient cost propagation
+            if new_node.parent is not None:
+                new_node.parent.children.append(new_node)
 
             #self._rewire(new_node, nearest_indeces)
 
@@ -304,29 +318,29 @@ class KinematicRRTStar:
             old_cost: float,
             new_cost: float
     ):
+    def _propagate_cost_to_children(self, parent_node: Node, old_cost: float, new_cost: float):
         """
-        Propagate cost updates to descendants after rewiring using an iterative BFS approach.
-        This prevents RecursionError and handles potential cycles gracefully.
+        Propagate cost delta to all descendants using children lists.
+        O(subtree_size) instead of O(n * subtree_depth).
+        Handles potential cycles by tracking visited nodes.
         """
         delta = new_cost - old_cost
 
-        # Iterative BFS using a queue
-        queue = [parent_node]
+        queue = list(parent_node.children)
         visited = {parent_node}
 
         while queue:
-            current_parent = queue.pop(0)
+            node = queue.pop(0)
+            if node in visited:
+                # Cycle detected — break it
+                node.parent = None
+                if node in parent_node.children:
+                    parent_node.children.remove(node)
+                continue
 
-            for node in self.node_list:
-                if node.parent == current_parent:
-                    if node in visited:
-                        # Cycle detected! Break the cycle to prevent infinite loops
-                        node.parent = None
-                        continue
-
-                    node.cost += delta
-                    visited.add(node)
-                    queue.append(node)
+            node.cost += delta
+            visited.add(node)
+            queue.extend(node.children)
 
     def _calc_new_cost(self, from_node: Node, to_node: Node) -> float:
         """
@@ -382,17 +396,29 @@ class KinematicRRTStar:
 
     def _get_near_nodes(self, new_node: Node) -> List[int]:
         """
-        Find all nodes in the tree within a certain radius of new_node (for rewiring).
+        Find all nodes in the tree within the RRT* optimal radius.
+        Uses the asymptotically optimal formula: r = γ · (log(n)/n)^(1/d)
+        capped to a maximum and floored to a minimum for practical effectiveness.
         """
+        n = len(self.node_list)
+        if n <= 1:
+            return []
 
-        radius = self.step_size * 5 # TODO da modificare con andamento logaritmico
-        near_indices= []
+        # RRT* optimal radius formula (d=2 dimensions)
+        gamma = self.step_size * 10.0    # tuning constant
+        radius = min(
+            gamma * (math.log(n) / n) ** 0.5,   # optimal shrinking radius
+            self.step_size * 5.0                  # maximum cap
+        )
+        # Minimum radius to ensure at least some rewiring
+        radius = max(radius, self.step_size * 1.5)
 
-        for i in range(len(self.node_list)):
-            x_n, y_n = new_node.x, new_node.y
-            x, y = self.node_list[i].x, self.node_list[i].y
-
-            dist = math.hypot(x - x_n, y - y_n)
+        near_indices = []
+        for i in range(n):
+            dist = math.hypot(
+                self.node_list[i].x - new_node.x,
+                self.node_list[i].y - new_node.y
+            )
             if dist < radius:
                 near_indices.append(i)
 
@@ -412,9 +438,171 @@ class KinematicRRTStar:
                 best=dist
         return best_index
 
+    def _choose_parent(self, new_node: Node, near_node_indices: List[int]) -> Node:
+        """
+        Phase A of Rewiring: Find the best parent for the new_node among its near neighbors
+        to minimize the cost to reach new_node.
+        """
+        if not near_node_indices:
+            return new_node
 
+        best_cost = inf
+        best_parent = None
+        best_path = []
+
+        for i in near_node_indices:
+            near_node = self.node_list[i]
+
+            # Simulate steering from near node to new node
+            #simulated_node = self._steer(near_node, new_node, max_travel=math.inf)
+            simulated_node = self._steer_clothoid(near_node, new_node, max_travel=math.inf)
+
+            if simulated_node is None:
+                continue
+
+            # Se la strada è libera da ostacoli
+            if self.collision_checker.is_path_free(simulated_node.path):
+                # Calcola il potenziale costo se passassimo da questo vicino
+                cost = self._calc_new_cost(near_node, simulated_node)
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_parent = near_node
+                    best_path = simulated_node.path
+
+        # Se abbiamo trovato un padre migliore rispetto a quello originale assegnato in plan()
+        if best_parent is not None:
+            # Remove from old parent's children if applicable
+            if new_node.parent is not None and new_node in new_node.parent.children:
+                new_node.parent.children.remove(new_node)
+            new_node.parent = best_parent
+            new_node.cost = best_cost
+            new_node.path = best_path
+
+        return new_node
 
     def _extract_path(self, last_node: Node):
+    def _rewire(self, new_node: Node, near_node_indices: List[int]):
+        """
+        Rewire nearby nodes through new_node if doing so reduces cost.
+
+        Optimized implementation:
+        - Uses extended _steer reach (max_travel = step_size * 3) for kinematic feasibility
+        - Tight reachability gate (step_size * 1.5) ensures precision
+        - Smoothness bonus: penalizes rewires that create heading discontinuities
+        - Efficient children-based cost propagation
+        - Robust cycle detection with depth limit
+        """
+        rewire_reach = self.step_size * 3.0
+
+        for i in near_node_indices:
+            near_node = self.node_list[i]
+
+            # === FAST REJECTION FILTERS ===
+
+            # Avoid self rewiring
+            if near_node is new_node:
+                continue
+
+            # Don't rewire the root
+            if near_node is self.start:
+                continue
+
+            # Skip if near_node is already a direct parent of new_node
+            if near_node.parent is new_node:
+                continue
+
+            # Skip if new_node is parent of near_node (already optimal link)
+            if new_node.parent is near_node:
+                continue
+
+            # === KINEMATIC FEASIBILITY ===
+
+            # Steer from new_node toward near_node with extended reach
+            #simulated_node = self._steer(new_node, near_node, max_travel=rewire_reach)
+            simulated_node = self._steer_clothoid(new_node, near_node, max_travel=rewire_reach)
+
+            if simulated_node is None:
+                continue
+
+            # Reachability gate: did we actually get close to near_node?
+            reach_dist = math.hypot(
+                simulated_node.x - near_node.x,
+                simulated_node.y - near_node.y
+            )
+            if reach_dist > self.step_size * 1.5:
+                continue
+
+            # === COLLISION CHECK ===
+            if not self.collision_checker.is_path_free(simulated_node.path):
+                continue
+
+            # === CYCLE DETECTION ===
+            # Walk new_node's ancestor chain (with depth limit for safety)
+            is_cycle = False
+            curr = new_node
+            depth = 0
+            max_depth = 200  # prevent infinite loops on corrupted trees
+            while curr is not None and depth < max_depth:
+                if curr is near_node:
+                    is_cycle = True
+                    break
+                curr = curr.parent
+                depth += 1
+            if is_cycle:
+                continue
+
+            # === COST COMPARISON WITH SMOOTHNESS BONUS ===
+            new_cost = self._calc_new_cost(new_node, simulated_node)
+
+            # Smoothness bonus: penalize rewires that create heading discontinuities
+            # This encourages the tree to form smooth, drivable paths
+            if new_node.parent is not None:
+                # Heading from new_node's parent to new_node
+                parent_heading = math.atan2(
+                    new_node.y - new_node.parent.y,
+                    new_node.x - new_node.parent.x
+                )
+                # Heading from new_node to near_node
+                rewire_heading = math.atan2(
+                    near_node.y - new_node.y,
+                    near_node.x - new_node.x
+                )
+                heading_continuity = abs(math.atan2(
+                    math.sin(rewire_heading - parent_heading),
+                    math.cos(rewire_heading - parent_heading)
+                ))
+                # Small penalty for non-smooth connections
+                smoothness_penalty = 0.5 * heading_continuity
+                new_cost += smoothness_penalty
+
+            # Rewire only if cost strictly improves
+            if new_cost < near_node.cost:
+                old_cost = near_node.cost
+
+                # Update children tracking: remove near_node from old parent's children
+                if near_node.parent is not None and near_node in near_node.parent.children:
+                    near_node.parent.children.remove(near_node)
+
+                near_node.parent = new_node
+                near_node.cost = new_cost
+                near_node.path = simulated_node.path
+
+                # Add to new parent's children list
+                if near_node not in new_node.children:
+                    new_node.children.append(near_node)
+
+                # Propagate cost improvement to all descendants
+                self._propagate_cost_to_children(near_node, old_cost, new_cost)
+
+    def _extract_path(self, last_node: Node) -> Tuple[List[Tuple[float, float, float]], float]:
+        """
+        Extract the full dense path from root to last_node by tracing parent chain
+        and concatenating all intermediate kinematic paths.
+
+        Returns:
+            Tuple of (dense_path, cost) where dense_path is a list of (x, y, theta).
+        """
         # Risali la catena di nodi
         nodes = []
         curr = last_node
