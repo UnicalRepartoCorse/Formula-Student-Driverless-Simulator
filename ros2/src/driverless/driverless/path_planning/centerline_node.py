@@ -21,8 +21,6 @@ from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
-
-from driverless.utils.collision_checker import CollisionChecker
 from fs_msgs.msg import Track
 
 
@@ -189,7 +187,7 @@ class CenterlineNode(Node):
         # Timing
         d('timer_period', 0.1)
         # Pre-filter
-        d('local_cone_radius', 30.0)
+        d('local_cone_radius', 20.0)
         d('front_fov_deg', 270.0)
         d('use_forward_filter', True)
         # Edge selection
@@ -669,7 +667,7 @@ class CenterlineNode(Node):
         res = self._p('smoothing_resolution')
         try:
             # Parametric spline fit
-            tck, u = splprep([pts[:, 0], pts[:, 1]], s=len(pts) * 0.5, k=3)
+            tck, u = splprep([pts[:, 0], pts[:, 1]], s=len(pts)* 0.5, k=3)
             # Estimate total arc length
             diffs = np.diff(pts, axis=0)
             arc = np.sum(np.hypot(diffs[:, 0], diffs[:, 1]))

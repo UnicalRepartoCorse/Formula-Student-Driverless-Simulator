@@ -55,3 +55,6 @@ def normalize_angle(angle):
     :rtype: float
     """
     return (angle + math.pi) % (2*math.pi) - math.pi
+
+def dist_sq(p,q):
+    return (p[0] - q[0])**2 + (p[1] - q[1])**2

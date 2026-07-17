@@ -3,6 +3,15 @@ from math import inf
 from typing import List, Tuple, Optional
 import numpy as np
 from scipy.interpolate import splprep, splev
+from scipy.spatial import Delaunay
+from scipy.optimize import minimize_scalar
+
+from .utils import dist_sq
+
+
+def _ccw(P, Q, R):
+    """Counter-clockwise check (helper function defined at module level for speed)."""
+    return (Q[0] - P[0]) * (R[1] - P[1]) - (Q[1] - P[1]) * (R[0] - P[0])
 
 
 class CollisionChecker:
@@ -11,24 +20,21 @@ class CollisionChecker:
 
     Strategies
     ----------
-    radial     : point must be farther than `cone_radius` from every cone.
+    radial     : point must be farther than `cone_radius` from every cone. Just for testing
     boundaries : point must lie inside the corridor defined by the blue (left)
                  and yellow (right) spline boundaries.
     """
 
-    def __init__(self, strategy: str = "boundaries", cone_radius: float = 0.9,
-                 spline_samples: int = 200):
+    def __init__(self, strategy: str = "boundaries", cone_radius: float = 0.9):
         """
         Parameters
         ----------
         strategy        : 'radial' or 'boundaries'
         cone_radius     : minimum safe distance from a cone centre [m]
-        spline_samples  : number of points used to densely sample each boundary
-                          spline (higher → more accurate curve representation)
         """
         self.strategy = strategy
         self.cone_radius = cone_radius
-        self.spline_samples = spline_samples
+        self.cone_radius_sq = cone_radius * cone_radius
 
         self.blue_cones:   List[Tuple[float, float]] = []
         self.yellow_cones: List[Tuple[float, float]] = []
@@ -37,12 +43,14 @@ class CollisionChecker:
         # Dense boundary polylines (Nx2 numpy arrays) built from splines
         self._blue_pts:   Optional[np.ndarray] = None
         self._yellow_pts: Optional[np.ndarray] = None
-
-        # Closed track polygon for point-in-polygon test (Nx2)
-        self._track_polygon: Optional[np.ndarray] = None
+        self._blue_tangents: Optional[np.ndarray] = None
+        self._yellow_tangents: Optional[np.ndarray] = None
+        self._blue_tck = None
+        self._yellow_tck = None
+        self._cones_array: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
-    # Public API
+    # UTILS
     # ------------------------------------------------------------------
 
     def update_cones(self,
@@ -54,8 +62,10 @@ class CollisionChecker:
         self.yellow_cones = yellow_cones
         self.orange_cones = orange_cones
 
-        if self.strategy == "boundaries":
-            self._build_boundaries()
+        all_cones = blue_cones + yellow_cones + orange_cones
+        self._cones_array = np.array(all_cones) if all_cones else None
+
+        return self._build_boundaries()
 
     def is_point_free(self, x: float, y: float) -> bool:
         """Return True if (x, y) is a collision-free configuration."""
@@ -67,13 +77,13 @@ class CollisionChecker:
             if not self._radial_check_point(x, y):
                 return False
             # Soft check: point must be inside the track corridor
-            if self._track_polygon is not None:
-                return self._point_in_polygon(x, y, self._track_polygon)
+            if self._blue_pts is not None and self._yellow_pts is not None:
+                return self._point_in_track(x, y)
             return True
 
         raise NotImplementedError(f"Unknown strategy: {self.strategy}")
 
-    def is_path_free(self, path: List[Tuple[float, float]]) -> bool:
+    def is_path_free(self, path: List[Tuple[float, float, float]]) -> bool:
         """
         Return True if every point and every segment of `path` is collision-free.
         """
@@ -84,202 +94,184 @@ class CollisionChecker:
             if not self.is_point_free(pt[0], pt[1]):
                 return False
 
-        if self.strategy == "boundaries" and \
-                self._blue_pts is not None and self._yellow_pts is not None:
+        if self.strategy == "boundaries" and self._blue_pts is not None and self._yellow_pts is not None:
             for i in range(len(path) - 1):
                 if self._segment_crosses_boundaries(path[i], path[i + 1]):
                     return False
-
         return True
+
+    def check_side(self, target_pt: Tuple[float, float], pts: np.ndarray, tangents: Optional[np.ndarray] = None) -> str:
+        """
+        Check if target_pt = (xp, yp) is to the left or right of the spline defined by its dense points.
+        Returns: 'left', 'right', or 'on_line'
+        """
+        if pts is None or len(pts) < 2:
+            return "on_line"
+        
+        # 1. Find closest point index using vectorized NumPy (squared distance) - optimized to avoid 2D allocation
+        dists_sq = (pts[:, 0] - target_pt[0])**2 + (pts[:, 1] - target_pt[1])**2
+        idx = np.argmin(dists_sq)
+        
+        # 2. Retrieve local direction (tangent) of the polyline at that index
+        if tangents is not None and len(tangents) > idx:
+            tx, ty = tangents[idx]
+        else:
+            # Fallback if tangents are not precomputed
+            if idx == 0:
+                tx = pts[1][0] - pts[0][0]
+                ty = pts[1][1] - pts[0][1]
+            elif idx == len(pts) - 1:
+                tx = pts[-1][0] - pts[-2][0]
+                ty = pts[-1][1] - pts[-2][1]
+            else:
+                tx = pts[idx + 1][0] - pts[idx - 1][0]
+                ty = pts[idx + 1][1] - pts[idx - 1][1]
+                
+            length = math.hypot(tx, ty)
+            if length > 0:
+                tx /= length
+                ty /= length
+            else:
+                tx, ty = 0.0, 0.0
+            
+        # 3. Vector from closest point to target point
+        vx = target_pt[0] - pts[idx][0]
+        vy = target_pt[1] - pts[idx][1]
+        
+        # 4. 2D cross product
+        cross_product = tx * vy - ty * vx
+        epsilon = 1e-5
+        
+        if cross_product > epsilon:
+            return "left"
+        elif cross_product < -epsilon:
+            return "right"
+        else:
+            return "on_line"
 
     # ------------------------------------------------------------------
     # Boundary construction
     # ------------------------------------------------------------------
 
-    def _build_boundaries(self):
-        """Order cones, fit splines, sample densely, build track polygon.
-
-        Orange cones mark the start line and are used as anchors for both
-        splines, ensuring the track polygon correctly encloses the vehicle
-        starting position at (0, 0).
-        """
-        if len(self.blue_cones) < 2 or len(self.yellow_cones) < 2:
-            self._blue_pts = None
-            self._yellow_pts = None
-            self._track_polygon = None
-            return
-
-        blue_ord   = self._nearest_neighbour_sort(self.blue_cones)
-        yellow_ord = self._nearest_neighbour_sort(self.yellow_cones)
-
-        # --- Anchor splines at the start line using orange cones ---
-        # Orange cones sit at the entry gate. Split them by Y sign:
-        #   Y > 0  →  left side  →  prepend to blue boundary
-        #   Y ≤ 0  →  right side →  prepend to yellow boundary
-        # If an orange cone sits exactly on the centreline (Y≈0) assign it
-        # to the side whose first ordered cone it is closest to.
-        if self.orange_cones:
-            left_anchors  = []
-            right_anchors = []
-            for oc in self.orange_cones:
-                ox, oy = oc
-                if oy > 0:
-                    left_anchors.append(oc)
-                elif oy < 0:
-                    right_anchors.append(oc)
-                else:
-                    # Y == 0: assign to nearest boundary
-                    d_blue   = math.hypot(ox - blue_ord[0][0],   oy - blue_ord[0][1])
-                    d_yellow = math.hypot(ox - yellow_ord[0][0], oy - yellow_ord[0][1])
-                    (left_anchors if d_blue <= d_yellow else right_anchors).append(oc)
-
-            # Sort anchors by distance from origin so the nearest gate-cone
-            # becomes the first vertex of the spline.
-            left_anchors.sort( key=lambda c: math.hypot(c[0], c[1]))
-            right_anchors.sort(key=lambda c: math.hypot(c[0], c[1]))
-
-            # Prepend: anchor → ordered boundary cones
-            blue_ord   = left_anchors  + blue_ord
-            yellow_ord = right_anchors + yellow_ord
-
-        self._blue_pts   = self._fit_and_sample(blue_ord)
-        self._yellow_pts = self._fit_and_sample(yellow_ord)
-
-        if self._blue_pts is not None and self._yellow_pts is not None:
-            # Close the polygon: blue forward + yellow reversed
-            # This traces the track corridor as a single closed ring.
-            self._track_polygon = np.vstack([
-                self._blue_pts,
-                self._yellow_pts[::-1]
-            ])
-
-    @staticmethod
-    def _nearest_neighbour_sort(cones: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """
-        Greedy nearest-neighbour ordering starting from the cone closest to
-        the vehicle origin (0, 0) — i.e. the first cone in the vehicle's path.
-
-        Works correctly in curves because it follows spatial proximity rather
-        than a single axis, so the resulting order matches the physical track
-        layout for any track shape.
-        """
-        if not cones:
-            return []
-
-        remaining = list(cones)
-
-        # Start from the cone nearest to the vehicle
-        # Usa: cono più avanti (max X) tra i N più vicini
-        candidates = sorted(remaining, key=lambda c: math.hypot(c[0], c[1]))[:3]
-        start_idx = remaining.index(max(candidates, key=lambda c: c[0]))
-        ordered = [remaining.pop(start_idx)]
-
-        while remaining:
-            last = ordered[-1]
-            nearest_idx = min(range(len(remaining)),
-                              key=lambda i: math.hypot(remaining[i][0] - last[0],
-                                                       remaining[i][1] - last[1]))
-            ordered.append(remaining.pop(nearest_idx))
-
-        return ordered
-
-    def _fit_and_sample(self, ordered_cones: List[Tuple[float, float]]) -> Optional[np.ndarray]:
-        """
-        Fit a parametric cubic spline through `ordered_cones` and return a
-        dense array of (x, y) samples.
-
-        Parametric form — t is cumulative arc-length between cone positions —
-        so the spline handles curves, hairpins and any non-monotonic shape
-        without the y = f(x) limitation.
-        """
-        pts = np.array(ordered_cones, dtype=float)  # (N, 2)
-        n = len(pts)
-
-        if n < 2:
+    def _compute_tangents(self, pts: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Precompute polyline tangents for fast lookup."""
+        if pts is None or len(pts) < 2:
             return None
+        n = len(pts)
+        tangents = np.zeros((n, 2))
+        tangents[0] = pts[1] - pts[0]
+        tangents[-1] = pts[-1] - pts[-2]
+        if n > 2:
+            tangents[1:-1] = pts[2:] - pts[:-2]
+        
+        norms = np.hypot(tangents[:, 0], tangents[:, 1])
+        valid = norms > 1e-9
+        tangents[valid] /= norms[valid][:, np.newaxis]
+        return tangents
 
-        # Polynomial degree: cubic when possible, lower for very few points
-        k = min(3, n - 1)
+    def _build_boundaries(self):
+        if len(self.blue_cones) >= 2:
+            #TODO DA RIMUOVERE POICHE RICEVO CONI GIA ORDNATI
+            blue_sorted = sorted(self.blue_cones, key=lambda p: p[0])
+            self._blue_pts, self._blue_tck = self.get_spline(np.array(blue_sorted))
+        elif len(self.blue_cones) == 1:
+            self._blue_pts = np.array(self.blue_cones)
+        else:
+            self._blue_pts = None
 
-        # Arc-length parameterisation avoids clustering artefacts in curves
-        diffs = np.diff(pts, axis=0)
-        seg_lengths = np.hypot(diffs[:, 0], diffs[:, 1])
-        t = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-        t /= t[-1]  # normalise to [0, 1]
+        if len(self.yellow_cones) >= 2:
+            #TODO DA RIMUOVERE POICHE RICEVO CONI GIA ORDNATI
+            yellow_sorted = sorted(self.yellow_cones, key=lambda p: p[0])
+            self._yellow_pts, self._yellow_tck = self.get_spline(np.array(yellow_sorted))
+        elif len(self.yellow_cones) == 1:
+            self._yellow_pts = np.array(self.yellow_cones)
+        else:
+            self._yellow_pts = None
 
-        try:
-            # s=0  → interpolating spline (passes through every cone exactly)
-            tck, _ = splprep([pts[:, 0], pts[:, 1]], u=t, s=0, k=k)
-        except Exception:
-            # Degenerate geometry — fall back to the raw cone positions
-            return pts
+        # Precompute tangents for fast boundary side checks
+        self._blue_tangents = self._compute_tangents(self._blue_pts)
+        self._yellow_tangents = self._compute_tangents(self._yellow_pts)
 
-        u_dense = np.linspace(0.0, 1.0, self.spline_samples)
-        x_s, y_s = splev(u_dense, tck)
-        return np.column_stack([x_s, y_s])  # (spline_samples, 2)
+        return self._blue_pts, self._yellow_pts
 
-    # ------------------------------------------------------------------
-    # Geometric helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _radial_check_point(x: float, y: float,
-                            cones: Optional[List[Tuple[float, float]]] = None,
-                            radius: float = 0.0) -> bool:
-        """Reusable; called as a method too — see is_point_free."""
-        # This is called as self._radial_check_point so we need instance access.
-        raise RuntimeError("Use instance method")
-
-    def _radial_check_point(self, x: float, y: float) -> bool:  # noqa: F811
-        all_cones = self.blue_cones + self.yellow_cones + self.orange_cones
-        for cx, cy in all_cones:
-            if math.hypot(x - cx, y - cy) < self.cone_radius:
-                return False
-        return True
-
-    @staticmethod
-    def _point_in_polygon(x: float, y: float, polygon: np.ndarray) -> bool:
+    def _intersect(self, A, B, C, D) -> bool:
         """
-        Ray-casting algorithm.
-        Cast a horizontal ray from (x, y) to +∞ and count crossings with the
-        polygon edges.  Odd count → inside.
+        Verifica se il segmento AB interseca il segmento CD.
+        """
+        # AABB (Bounding Box) check per rigetto rapido
+        if (max(A[0], B[0]) < min(C[0], D[0]) or
+            min(A[0], B[0]) > max(C[0], D[0]) or
+            max(A[1], B[1]) < min(C[1], D[1]) or
+            min(A[1], B[1]) > max(C[1], D[1])):
+            return False
 
-        Robust for any convex or concave closed polygon.
-        """
-        n = len(polygon)
-        inside = False
-        j = n - 1
-        for i in range(n):
-            xi, yi = polygon[i]
-            xj, yj = polygon[j]
-            # Edge crosses the horizontal ray at x?
-            if ((yi > y) != (yj > y)) and \
-                    (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
-                inside = not inside
-            j = i
-        return inside
+        return (_ccw(A, B, C) * _ccw(A, B, D) <= 0) and (_ccw(C, D, A) * _ccw(C, D, B) <= 0)
 
-    def _segment_crosses_boundaries(self,
-                                    p1: Tuple[float, float],
-                                    p2: Tuple[float, float]) -> bool:
+    def _segment_intersects_polyline(self, A, B, polyline) -> bool:
         """
-        Return True if the segment p1→p2 intersects any edge of the dense
-        blue or yellow boundary polylines.
+        Ritorna True se il segmento AB interseca uno qualsiasi dei segmenti della polilinea.
+        Utilizza una ricerca locale attorno al punto più vicino per massimizzare la velocità.
         """
-        for boundary in (self._blue_pts, self._yellow_pts):
-            if boundary is None:
-                continue
-            for i in range(len(boundary) - 1):
-                if self._segments_intersect(p1, p2,
-                                            tuple(boundary[i]),
-                                            tuple(boundary[i + 1])):
-                    return True
+        if polyline is None or len(polyline) < 2:
+            return False
+        
+        # 1. Trova il punto della polilinea più vicino ad A usando NumPy vettorizzato
+        dists_sq = (polyline[:, 0] - A[0])**2 + (polyline[:, 1] - A[1])**2
+        idx = np.argmin(dists_sq)
+        
+        # 2. Controlla solo i segmenti adiacenti (finestra di ±5 indici)
+        start = max(0, idx - 5)
+        end = min(len(polyline) - 1, idx + 5)
+        
+        for i in range(start, end):
+            if self._intersect(A, B, polyline[i], polyline[i+1]):
+                return True
         return False
 
-    @staticmethod
-    def _ccw(A, B, C) -> bool:
-        return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+    def _segment_crosses_boundaries(self, from_node, to_node) -> bool:
+        """
+        Nodes are represented by (x, y, theta) or (x, y).
+        Checks if the segment from_node -> to_node crosses any boundary.
+        """
+        A = (from_node[0], from_node[1])
+        B = (to_node[0], to_node[1])
 
-    def _segments_intersect(self, A, B, C, D) -> bool:
-        return (self._ccw(A, C, D) != self._ccw(B, C, D) and
-                self._ccw(A, B, C) != self._ccw(A, B, D))
+        if self._segment_intersects_polyline(A, B, self._blue_pts):
+            return True
+        if self._segment_intersects_polyline(A, B, self._yellow_pts):
+            return True
+
+        return False
+
+    def _point_in_track(self, x: float, y: float) -> bool:
+        return (self.check_side((x, y), self._blue_pts, self._blue_tangents) == "right" and 
+                self.check_side((x, y), self._yellow_pts, self._yellow_tangents) == "left")
+
+    # ------------------------------------------------------------------
+    # Radial check
+    # ------------------------------------------------------------------
+
+    def _radial_check_point(self, x: float, y: float) -> bool:
+        if self._cones_array is None or len(self._cones_array) == 0:
+            return True
+        dists_sq = (self._cones_array[:, 0] - x)**2 + (self._cones_array[:, 1] - y)**2
+        return not np.any(dists_sq < self.cone_radius_sq)
+
+    def get_spline(self, points):
+        res = 0.5
+        try:
+            # Parametric spline fit
+            tck, u = splprep([points[:, 0], points[:, 1]], s=len(points) * 0.5, k=2)
+            # Estimate total arc length
+            diffs = np.diff(points, axis=0)
+            arc = np.sum(np.hypot(diffs[:, 0], diffs[:, 1]))
+            n_samples = max(int(arc / res), len(points))
+            u_new = np.linspace(0, 1, n_samples)
+            sx, sy = splev(u_new, tck)
+            return np.column_stack([sx, sy]), tck
+        except Exception as e:
+            print(f"Spline failed, using polyline: {e}")
+            return points, None
+
+    def xy_limit(self):
+        pass

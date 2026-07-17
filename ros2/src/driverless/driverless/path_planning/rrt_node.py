@@ -11,8 +11,10 @@ from builtin_interfaces.msg import Duration
 from nav_msgs.msg import Path, Odometry
 from driverless.utils.collision_checker import CollisionChecker
 from driverless.utils.utils import normalize_angle
-from .rrt_star import KinematicRRTStar
+from .rrt_star import RRTStar
 from .rrt_star import Node as RRTNodeState
+
+# ENU FRAME
 
 class RRTNode(Node):
     """
@@ -29,10 +31,11 @@ class RRTNode(Node):
         self.declare_parameter('collision_strategy', 'radial')
         self.declare_parameter('max_steering_angle', math.radians(24)) # rad
         self.declare_parameter('wheelbase', 1.58) # m
-        self.declare_parameter('step_size', 0.3) # m
+        self.declare_parameter('step_size', 0.2) # m
         self.declare_parameter('sample_radius_centerline', 1.4)
-        self.declare_parameter('max_iter', 700)
-        self.declare_parameter('num_trees', 3)
+        self.declare_parameter('max_iter', 900)
+        self.declare_parameter('num_trees', 1)
+        self.declare_parameter('last_point', 4)
         self.declare_parameter('centerline_topic', '/track/centerline')
         self.declare_parameter('cones_topic', '/fsds/testing_only/track')
 
@@ -55,7 +58,7 @@ class RRTNode(Node):
         self.n_blue_at_last_plan:   int = 0
         self.n_yellow_at_last_plan: int = 0
         # Soglia: quanti NUOVI coni per lato triggherano un replan
-        self.NEW_CONE_THRESHOLD: int = 0
+        self.NEW_CONE_THRESHOLD: int = 2
         # Ultimo punto del path precedente in frame GLOBALE (gx, gy, gtheta)
         self.last_goal_global = None
         # Ultima goal line calcolata in coordinate GLOBALI ((gx1, gy1), (gx2, gy2))
@@ -97,11 +100,23 @@ class RRTNode(Node):
         # Publisher for RViz visualization
         self.viz_pub = self.create_publisher(MarkerArray, '/planning/viz', 10)
 
+        # Publishers for boundary paths
+        self.blue_boundary_pub = self.create_publisher(
+            Path,
+            '/planning/blue_boundary',
+            10
+        )
+        self.yellow_boundary_pub = self.create_publisher(
+            Path,
+            '/planning/yellow_boundary',
+            10
+        )
+
         self.last_track_msg = None
         self.timer = self.create_timer(0.1, self.plan_timer_callback) # 10 Hz
 
         # Initialize the collision checker
-        self.collision_checker = CollisionChecker(strategy=collision_strategy,cone_radius=0.3)
+        self.collision_checker = CollisionChecker(strategy=collision_strategy, cone_radius=0.7)
 
         self.get_logger().info(f"RRT* Node Initialized. Subscribed to {cones_topic} with strategy {collision_strategy}")
 
@@ -143,7 +158,7 @@ class RRTNode(Node):
         for c in msg.track:
             gx, gy = c.location.x, c.location.y
             dist = math.hypot(gx - self.car_x, gy - self.car_y)
-            if dist < 5.0:
+            if dist < 10.0:
                 dx = gx - self.car_x
                 dy = gy - self.car_y
                 lx = dx * math.cos(self.car_yaw) + dy * math.sin(self.car_yaw)
@@ -177,6 +192,9 @@ class RRTNode(Node):
         else:
             self.last_yellow_boundary = []
 
+        # Pubblica i contorni su topic dedicati
+        self.publish_boundary_paths()
+
         # Collect all coordinates for bounds calculation
         all_local_cones = local_blue_cones + local_yellow_cones + local_orange_cones
         if not all_local_cones:
@@ -192,6 +210,7 @@ class RRTNode(Node):
 
         new_blue   = len(self.seen_blue_keys)   - self.n_blue_at_last_plan
         new_yellow = len(self.seen_yellow_keys) - self.n_yellow_at_last_plan
+
 
         # Replan solo se ci sono abbastanza nuovi coni su ENTRAMBI i lati
         # oppure se non abbiamo ancora nessun path
@@ -255,7 +274,7 @@ class RRTNode(Node):
         # 5. Start del nuovo RRT: prendiamo il 4° punto dalla fine del path precedente (se disponibile)
         #    per garantire una transizione liscia, altrimenti partiamo dall'origine (posizione auto).
 
-        last_point = 4
+        last_point = self.get_parameter('last_point').value
         if self.last_path_global_states and len(self.last_path_global_states) >=last_point:
             start_state_global = self.last_path_global_states[-last_point]
             lgx, lgy, lgtheta = start_state_global
@@ -281,10 +300,6 @@ class RRTNode(Node):
             rrt_start = (0.0, 0.0, 0.0)
             overlap_count = 0
 
-        # 6. Bounds di campionamento
-        padding = 0.7
-        bounds = (min(lx_coords) - padding, max(lx_coords) + padding,
-                  min(ly_coords) - padding, max(ly_coords) + padding)
 
         # Calcolo dei target per il campionamento (target-biased)
         rrt_targets = []
@@ -296,10 +311,9 @@ class RRTNode(Node):
         trees = []
         for i in range(self.get_parameter('num_trees').value):
             # 7. Run RRT* dal punto di estensione
-            rrt = KinematicRRTStar(
+            rrt = RRTStar(
                 start=rrt_start,
                 goal_line=goal_line,
-                bounds=bounds,
                 collision_checker=self.collision_checker,
                 max_steering_angle=self.get_parameter('max_steering_angle').value,
                 wheelbase=self.get_parameter('wheelbase').value,
@@ -350,13 +364,6 @@ class RRTNode(Node):
             # Aggiorna soglia coni
             self.n_blue_at_last_plan   = len(self.seen_blue_keys)
             self.n_yellow_at_last_plan = len(self.seen_yellow_keys)
-
-       #    self.get_logger().info(
-       #        f"Replan OK: +{new_blue} blue, +{new_yellow} yellow | "
-       #        f"path={len(self.published_path_global)} pts"
-       #    )
-       #else:
-       #    self.get_logger().warn("RRT* replan failed — keeping old path")
 
         # 8. Pubblica e visualizza
         self.publish_path(self.published_path_global)
@@ -648,6 +655,40 @@ class RRTNode(Node):
             msg.poses.append(pose)
 
         self.trajectory_pub.publish(msg)
+
+    def publish_boundary_paths(self):
+        """
+        Publishes the blue and yellow boundaries as Path messages.
+        """
+        now = self.get_clock().now().to_msg()
+
+        blue_msg = Path()
+        blue_msg.header.stamp = now
+        blue_msg.header.frame_id = 'fsds/map'
+        if hasattr(self, 'last_blue_boundary') and self.last_blue_boundary:
+            for p in self.last_blue_boundary:
+                pose = PoseStamped()
+                pose.header = blue_msg.header
+                pose.pose.position.x = float(p[0])
+                pose.pose.position.y = float(p[1])
+                pose.pose.position.z = 0.0
+                pose.pose.orientation.w = 1.0
+                blue_msg.poses.append(pose)
+        self.blue_boundary_pub.publish(blue_msg)
+
+        yellow_msg = Path()
+        yellow_msg.header.stamp = now
+        yellow_msg.header.frame_id = 'fsds/map'
+        if hasattr(self, 'last_yellow_boundary') and self.last_yellow_boundary:
+            for p in self.last_yellow_boundary:
+                pose = PoseStamped()
+                pose.header = yellow_msg.header
+                pose.pose.position.x = float(p[0])
+                pose.pose.position.y = float(p[1])
+                pose.pose.position.z = 0.0
+                pose.pose.orientation.w = 1.0
+                yellow_msg.poses.append(pose)
+        self.yellow_boundary_pub.publish(yellow_msg)
 
 def main(args=None):
     rclpy.init(args=args)
