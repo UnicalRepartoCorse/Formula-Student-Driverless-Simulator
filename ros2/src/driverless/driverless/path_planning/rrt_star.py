@@ -162,7 +162,7 @@ class RRTStar:
 
             new_node = self._steer(nearest_node, sample, self.step_size)
 
-            new_node.parent = nearest_node
+            #new_node.parent = nearest_node
             new_node.cost = self._calc_new_cost(nearest_node, new_node)
             new_node.dist_to_goal = self._dist_to_goal_line(new_node.x, new_node.y)
 
@@ -171,8 +171,8 @@ class RRTStar:
                 continue
 
             nearest_indeces = self._get_near_nodes(new_node)
-            new_node = self._choose_parent(new_node, nearest_indeces) #update parent, cost and path of the new node
 
+            new_node = self._choose_parent(new_node, nearest_indeces) #update parent, cost and path of the new node
             self.node_list.append(new_node)
             # Maintain node_coords
             self.node_coords[len(self.node_list) - 1] = [new_node.x, new_node.y]
@@ -263,7 +263,7 @@ class RRTStar:
 
         newNode = Node(new_x, new_y, new_theta)
         newNode.cost = nearest_node.cost + step_len
-        newNode.parent = sample
+        newNode.parent = nearest_node
         newNode.path = [(new_x, new_y, new_theta)]
 
         return newNode
@@ -334,7 +334,23 @@ class RRTStar:
 
             cl_penalty = 1.0 - abs(cos_sim)
 
-        return from_node.cost + path_cost + cl_penalty
+        # ---THETA BETWEEN NODES PENALTY ---
+        # Kinematic Ratio with
+        dx = to_node.x - from_node.x
+        dy = to_node.y - from_node.y
+        step_len_sq = dx*dx + dy*dy
+        if step_len_sq > 1e-10:
+            delta_theta = abs(normalize_angle(to_node.theta - from_node.theta))
+            # ratio^2 ~= ((delta_theta * wheelbase) / (step_len * max_steering))^2
+            num = delta_theta * self.wheelbase
+            den = self.max_steering_angle
+            steer_ratio_sq = (num * num) / (step_len_sq * den * den)
+            
+            heading_penalty = steer_ratio_sq #* HEADING_WEIGHT
+        else:
+            heading_penalty = 0.0
+
+        return from_node.cost + path_cost + cl_penalty + heading_penalty
 
     def _get_near_nodes(self, new_node: Node) -> List[int]:
         """
@@ -525,10 +541,10 @@ class RRTStar:
         k = min(3, len(unique_pts) - 1)
 
         try:
-            tck, u_evaluated = splprep([x, y], u=u, s=len(x) * 0.5, k=2) #maybe use k
+            tck, u_evaluated = splprep([x, y], u=u, s=len(x) * 0.5, k=k)
 
             # Generate dense points along the curve (5cm intervals)
-            num_points = max(4, int(total_length / 1.5)) # between 1 - 2
+            num_points = max(10, int(total_length / 1)) # between 1 - 2
             u_new = np.linspace(0.0, 1.0, num_points)
 
             # Evaluate curve coordinates and first derivatives

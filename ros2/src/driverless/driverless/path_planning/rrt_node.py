@@ -33,9 +33,9 @@ class RRTNode(Node):
         self.declare_parameter('wheelbase', 1.58) # m
         self.declare_parameter('step_size', 0.2) # m
         self.declare_parameter('sample_radius_centerline', 1.4)
-        self.declare_parameter('max_iter', 900)
+        self.declare_parameter('max_iter', 700)
         self.declare_parameter('num_trees', 1)
-        self.declare_parameter('last_point', 4)
+        self.declare_parameter('last_point', 3)
         self.declare_parameter('centerline_topic', '/track/centerline')
         self.declare_parameter('cones_topic', '/fsds/testing_only/track')
 
@@ -58,7 +58,7 @@ class RRTNode(Node):
         self.n_blue_at_last_plan:   int = 0
         self.n_yellow_at_last_plan: int = 0
         # Soglia: quanti NUOVI coni per lato triggherano un replan
-        self.NEW_CONE_THRESHOLD: int = 2
+        self.NEW_CONE_THRESHOLD: int = 3
         # Ultimo punto del path precedente in frame GLOBALE (gx, gy, gtheta)
         self.last_goal_global = None
         # Ultima goal line calcolata in coordinate GLOBALI ((gx1, gy1), (gx2, gy2))
@@ -210,7 +210,6 @@ class RRTNode(Node):
 
         new_blue   = len(self.seen_blue_keys)   - self.n_blue_at_last_plan
         new_yellow = len(self.seen_yellow_keys) - self.n_yellow_at_last_plan
-
 
         # Replan solo se ci sono abbastanza nuovi coni su ENTRAMBI i lati
         # oppure se non abbiamo ancora nessun path
@@ -369,6 +368,7 @@ class RRTNode(Node):
         self.publish_path(self.published_path_global)
         self.publish_viz(self.published_path_global, rrt.node_list, self.last_goal_line_global,
                          global_blue_cones, global_yellow_cones, global_orange_cones, rrt.sampled_points)
+
 
     def _trim_published_path(self):
         """Rimuove i waypoint già percorsi (più di 3 m dietro la macchina)."""
