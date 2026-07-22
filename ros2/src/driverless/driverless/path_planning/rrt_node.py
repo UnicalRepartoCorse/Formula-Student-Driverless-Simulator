@@ -31,10 +31,10 @@ class RRTNode(Node):
         self.declare_parameter('max_steering_angle', math.radians(24)) # rad
         self.declare_parameter('wheelbase', 1.58) # m
         self.declare_parameter('step_size', 0.2) # m
-        self.declare_parameter('sample_radius_centerline', 1.4)
-        self.declare_parameter('max_iter', 700)
+        self.declare_parameter('sample_radius_centerline', 1.35)
+        self.declare_parameter('max_iter', 600)
         self.declare_parameter('num_trees', 1)
-        self.declare_parameter('last_point', 3)
+        self.declare_parameter('last_point', 4)
         self.declare_parameter('centerline_topic', '/track/centerline')
         self.declare_parameter('cones_topic', '/fsds/testing_only/track')
 
@@ -281,16 +281,14 @@ class RRTNode(Node):
             overlap = current_visible_keys & self._start_cone_keys
             if len(overlap) >= self._MIN_START_REENCOUNTER:
                 self.get_logger().info(
-                    f"Giro completato! Ri-incontrati {len(overlap)} coni di partenza. Reset completo.")
-                # Reset completo dello stato di planning
+                    f"Giro completato! Ri-incontrati {len(overlap)} coni di partenza. Reset memoria coni.")
+                # Reset solo della memoria dei coni — il path e il goal restano
+                # intatti per garantire continuità. Il replan avverrà naturalmente
+                # perché i contatori azzerati triggerano should_replan = True.
                 self.seen_blue_keys.clear()
                 self.seen_yellow_keys.clear()
                 self.n_blue_at_last_plan = 0
                 self.n_yellow_at_last_plan = 0
-                self.last_goal_global = None
-                self.last_goal_line_global = None
-                self.published_path_global = []
-                self.last_path_global_states = []
                 # Reset multi-lap: pronto per il prossimo giro
                 self._left_start_zone = False
 
