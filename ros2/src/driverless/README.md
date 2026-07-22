@@ -121,7 +121,7 @@ L'implementazione è strutturata in due moduli principali:
 
 A differenza del classico RRT, questa versione tiene conto dei vincoli dinamici e geometrici della vettura:
 
-* **Modello Cinematico della Vettura (Bicicletta):** Durante l'espansione dell'albero (funzione `_steer`), la traiettoria da un nodo all'altro viene simulata integrando le equazioni cinematiche del modello a bicicletta. Lo sterzo è guidato da una legge ispirata al **Pure Pursuit** basata sull'errore di orientamento rispetto al target, limitata dall'angolo di sterzo massimo (`max_steering_angle`).
+* **Modello Cinematico della Vettura (Bicicletta):** Durante l'espansione dell'albero (funzione `_steer`), una Bezier quintica raccorda le pose dei nodi con curvatura continua e nulla agli estremi. La curvatura viene convertita nell'angolo di sterzo del modello a bicicletta e i raccordi oltre `max_steering_angle` vengono scartati, senza saturazioni brusche.
 * **Campionamento Guidato da Centerline:** Se disponibile una linea di mezzeria (centerline), il campionamento non avviene in modo uniforme in tutto lo spazio, ma viene circoscritto entro un raggio predefinito (`sample_radius_centerline`) attorno a punti casuali della centerline. Questo accelera notevolmente la convergenza e mantiene l'albero nella carreggiata.
 * **Funzione di Costo Custom:** Il costo di ogni nodo (`_calc_new_cost`) include:
   * Lunghezza geometrica reale del percorso (somma dei segmenti integrati).
@@ -162,4 +162,3 @@ I seguenti parametri sono configurabili all'avvio del nodo (es. tramite file di 
 | `max_iter` | int | `500` | Numero massimo di iterazioni per ogni ciclo di pianificazione. |
 | `centerline_topic` | string | `'/track/centerline'` | Topic ROS 2 da cui ricevere la centerline. |
 | `cones_topic` | string | `'/fsds/testing_only/track'` | Topic ROS 2 da cui ricevere la mappa dei coni. |
-
