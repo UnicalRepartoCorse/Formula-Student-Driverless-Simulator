@@ -4,7 +4,7 @@
   <name>driverless</name>
   <version>0.0.1</version>
   <description>Driverless car package</description>
-  <maintainer email="-">URC</maintainer>
+  <maintainer email="paolocosta2002@gmail.com">URC</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

@@ -34,8 +34,8 @@ class PurePursuitNode(Node):
         # --- Subscribers & Publishers ---
         self.path_sub = self.create_subscription(
             Path,
-            '/planning/trajectory', #FOR RRT PATH FOLLOWING
-            #'/track/centerline', #FOR CENTERLINE PATH FOLLOWING
+            #'/planning/trajectory', #FOR RRT PATH FOLLOWING
+            '/track/centerline', #FOR CENTERLINE PATH FOLLOWING
             self.path_callback,
             10
         )
