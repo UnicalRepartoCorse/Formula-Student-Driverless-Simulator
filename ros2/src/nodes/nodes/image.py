@@ -1,37 +1,35 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import PointStamped
-from nav_msgs.msg import Odometry
-from vision_msgs.msg import Detection2DArray, Detection2D
 from cv_bridge import CvBridge
 import cv2
-import numpy as np
+import tf2_geometry_msgs
 import sys
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 import queue
 import tf2_ros
 
-venv_path = "/home/lenovo/Formula-Student-Driverless-Simulator/ros_env/lib/python3.12/site-packages"
-if venv_path in sys.path:
-    sys.path.remove(venv_path)
-sys.path.insert(0, venv_path)
+#venv_path = "/home/lenovo/Formula-Student-Driverless-Simulator/ros_env/lib/python3.12/site-packages"
+#if venv_path in sys.path:
+#    sys.path.remove(venv_path)
+#sys.path.insert(0, venv_path)
 
-#from . import inject
+import inject
 from ultralytics import YOLO
 import ultralytics.nn.modules as modules
 import ultralytics.nn.tasks as tasks
 
-#modules.DW = inject.DW
-#tasks.DW = inject.DW
+modules.CDW = inject.CDW
+tasks.CDW = inject.CDW
+modules.CDW = inject.CDW
+tasks.DW = inject.DW
 
-#modules.CDW = inject.CDW
-#tasks.CDW = inject.CDW
 
 
 def get_camera_values(node):
-    node.fx, node.fy = 392.5, 392.5, 392.5, 392.5
+    node.cx, node.cy, node.fx, node.fy = 392.5, 392.5, 392.5, 392.5
 
 
 class ImageListener(Node):
@@ -49,7 +47,7 @@ class ImageListener(Node):
         self.detection_group = MutuallyExclusiveCallbackGroup()
         self.processing_group = MutuallyExclusiveCallbackGroup()
 
-        model_path = "/home/lenovo/Formula-Student-Driverless-Simulator/ros2/src/nodes/nodes/custom_b_openvino_model"
+        model_path = "/home/lenovo/Formula-Student-Driverless-Simulator/ros2/src/nodes/nodes/custom_b.pt"
         try:
             self.model = YOLO(model_path)
             #self.model.to("cuda")
@@ -77,13 +75,15 @@ class ImageListener(Node):
         
         self.publisher_h = self.create_publisher(PointStamped, 'Stereo/h_cone_coords', 10)
         self.publisher = self.create_publisher(PointStamped, 'Stereo/cone_coords', 10)
-        self.rviz_img = self.create_publisher(Image, 'Stereo/predicted_image', 10)
-        
         self.process_timer = self.create_timer(
             0.01,
             self.processing_callback,
             callback_group = self.processing_group
         )
+
+        if self.test:
+            self.rviz_img = self.create_publisher(Image, 'Stereo/predicted_image', 10)
+        
 
 
     def listener_callback(self, msg):
@@ -97,15 +97,18 @@ class ImageListener(Node):
         
             all_detections = []
             boxes = result.boxes
-            for box in boxes:
-                score = box.conf[0].item()
-                class_id = box.cls[0].item()
-                # Coordinate [x1, y1, x2, y2]
-                coords = box.xyxy[0].cpu().numpy()
-                all_detections.append((score, class_id, coords))
-                det2d = (msg.header, tuple(coords))
-                self.queue.put(det2d)
+            scores = boxes.conf.cpu().numpy().tolist()
+            class_ids = boxes.cls.cpu().numpy().astype(int).tolist() # Cast classes to clean integers
+            coords = boxes.xyxy.cpu().numpy().tolist()
 
+            # 2. Append them rapidly using zip() - no need to track index counters manually!
+            for score, class_id, coord in zip(scores, class_ids, coords):
+                all_detections.append((score, class_id, coord))
+                det2d = (msg.header, tuple(coord))
+                try:
+                    self.queue.put_nowait(det2d)
+                except queue.Full:
+                    self.get_logger().warn("Processing thread is too slow! Dropping frame data.")
 
             if not self.test:
                 return
@@ -134,7 +137,7 @@ class ImageListener(Node):
                 #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             #'''
-            cv2.imwrite(f'output_{conf}.png', display_frame)
+            #cv2.imwrite(f'output_{conf}.png', display_frame)
             '''
             with open("coords.txt", "w") as file:
                 for i, det in enumerate(all_detections):
@@ -145,25 +148,21 @@ class ImageListener(Node):
             #cv2.waitKey(10000)
 
             '''
-            self.get_logger().warn("exiting as test image was produced")
-            self.destroy_node()
-            self.rviz_img.publish(self.bridge.cv2.to_imgmsg(display_frame, encoding="rgb8"))
+            #self.get_logger().warn("exiting as test image was produced")
+            #self.destroy_node()
+            self.rviz_img.publish(self.bridge.cv2_to_imgmsg(display_frame, encoding="bgr8"))
 
         except Exception as e:
             self.get_logger().error(f'Errore callback: {str(e)}')
         
-        try:
-            for det in all_detections:
-                self.queue.put_nowait((msg.header, det))
-        except queue.Full:
-            self.get_logger().warn("Processing thread is too slow! Dropping frame data.")
-
 
     def processing_callback(self):
         if self.queue.empty():
             return
 
-        header, det = self.data_queue.get() 
+        header, det = self.queue.get() 
+        self.get_logger().info(f'Errore callback: {det}')
+
         x1, _, x2, y2 = det
 
         x = (x2+x1)/2.
@@ -174,10 +173,10 @@ class ImageListener(Node):
         try:
             camera_frame = header.frame_id  
             transform = self.tf_buffer.lookup_transform(
-                'map', 
-                camera_frame, 
+                'fsds/map', 
+                camera_frame[1:], 
                 header.stamp,
-                rclpy.duration.Duration(seconds=0.1)  
+                rclpy.duration.Duration(seconds=0.2)
             )
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().warn(f"TF lookup failed: {e}")
@@ -204,8 +203,8 @@ class ImageListener(Node):
         r_y = ray_end_world.point.y - c_y
         r_z = ray_end_world.point.z - c_z
 
-        if rz >= 0: return
-        t = -c_z / rz
+        if r_z >= 0: return
+        t = -c_z / r_z
 
         x_global = c_x + (t * r_x)
         y_global = c_y + (t * r_y)
@@ -215,16 +214,17 @@ class ImageListener(Node):
 
         msg_h, msg = PointStamped(), PointStamped()
         msg_h.header.stamp = header.stamp
-        msg_h.header.frame_id = "map"
-        msg_h.x, msg_h.y, msg_h.z = x_global*heuristic_factor, y_global*heuristic_factor, 0.
+        msg_h.header.frame_id = "fsds/map"
+        msg_h.point.x, msg_h.point.y, msg_h.point.z = x_global*heuristic_factor, y_global*heuristic_factor, 0.
 
         msg.header.stamp = header.stamp
-        msg.header.frame_id = "map"
-        msg.x, msg.y, msg.z = x_global, y_global, 0.
+        msg.header.frame_id = "fsds/map"
+        msg.point.x, msg.point.y, msg.point.z = x_global, y_global, 0.
 
 
         self.publisher.publish(msg)
         self.publisher_h.publish(msg_h)
+
 
 def main(args=None):
     rclpy.init(args=args)
