@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path, Odometry
 from fs_msgs.msg import ControlCommand
+from fs_msgs.srv import Reset
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from visualization_msgs.msg import Marker
@@ -18,9 +19,9 @@ class PurePursuitNode(Node):
 
         # --- Parameters ---
         self.lookahead_distance = 2.5  # meters
-        self.wheelbase = 1.5          # meters
-        self.max_steering_angle = 0.5  # radians
-        self.min_speed = 0.2           # m/s minimum speed (reduced for slow driving)
+        self.wheelbase = 1.58          # meters
+        self.max_steering_angle = math.radians(24)  # radians
+        self.min_speed = 0.7         # m/s minimum speed (reduced for slow driving)
 
         # State variables
         self.path = []
@@ -33,7 +34,8 @@ class PurePursuitNode(Node):
         # --- Subscribers & Publishers ---
         self.path_sub = self.create_subscription(
             Path,
-            '/planning/trajectory',
+            '/planning/trajectory', #FOR RRT PATH FOLLOWING
+            #'/track/centerline', #FOR CENTERLINE PATH FOLLOWING
             self.path_callback,
             10
         )
@@ -185,7 +187,7 @@ class PurePursuitNode(Node):
 
         # STRICT SPEED LIMIT FOR DEBUGGING
         # Ignore target_speed from RRT completely to guarantee slow movement
-        target_v = 3.0
+        target_v = 6
         final_speed = self.min_speed + (target_v - self.min_speed) * speed_factor
 
         # Simple proportional speed controller
@@ -208,6 +210,22 @@ class PurePursuitNode(Node):
         if self._ctrl_log_count % 20 == 0:
             self.get_logger().info(f"Ctrl: throttle={msg.throttle:.2f}, steering={msg.steering:.2f}, brake={msg.brake:.2f}, speed_err={speed_error:.2f}")
 
+    def reset_simulator(self):
+        #self.get_logger().info("Sending reset request to /fsds/reset...")
+        #import subprocess
+        #try:
+        #    # We call the service via subprocess to ensure it runs reliably
+        #    # even during KeyboardInterrupt / node shutdown sequence.
+        #    subprocess.run(
+        #        ["ros2", "service", "call", "/fsds/reset", "fs_msgs/srv/Reset", "{wait_on_last_task: false}"],
+        #        stdout=subprocess.DEVNULL,
+        #        stderr=subprocess.DEVNULL,
+        #        timeout=2.0
+        #    )
+        #    self.get_logger().info("Reset request completed.")
+        #except Exception as e:
+        #    self.get_logger().error(f"Failed to call reset service via subprocess: {e}")
+        pass
 def main(args=None):
     rclpy.init(args=args)
     node = PurePursuitNode()
@@ -216,6 +234,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            node.reset_simulator()
+        except Exception as e:
+            node.get_logger().error(f"Failed to reset simulator: {e}")
         node.destroy_node()
         rclpy.shutdown()
 

@@ -1,7 +1,13 @@
 import math
 import random
-from math import inf
+from collections import deque
+from math import inf, atan2
 from typing import List, Tuple, Optional
+
+import numpy as np
+from scipy.interpolate import splprep, splev
+from scipy.spatial import cKDTree
+
 from driverless.utils.collision_checker import CollisionChecker
 from driverless.utils.utils import normalize_angle
 
@@ -19,34 +25,42 @@ class Node:
     """
     Represents a node in the RRT* tree.
     """
+    __slots__ = ('x', 'y', 'theta', 'cos_theta', 'sin_theta',
+                 'cost', 'parent', 'children', 'dist_to_goal', 'path')
+
     def __init__(self, x: float, y: float, theta: float):
         self.x = x
         self.y = y
         self.theta = theta
+        # Cache trigonometric functions of theta to avoid repeating math.cos/math.sin calls
+        self.cos_theta = math.cos(theta)
+        self.sin_theta = math.sin(theta)
         self.cost = 0.0
         self.parent = None
-        self.children = []   # lista di nodi figli per propagazione costi efficiente
-        #storing dist to goal for efficiency
-        self.dist_to_goal = inf
-        # Store the path of (x, y, theta) coordinates from the parent to this node
-        self.path = []
+        self.children = []   # childer list for efficiency
+        self.dist_to_goal = inf # storing dist to goal for efficiency
+        self.path = [] # Store the path of (x, y, theta) coordinates from the parent to this node
 
-class KinematicRRTStar:
+class RRTStar:
     """
     Kinematic RRT* algorithm for path planning.
     Takes into account the maximum steering angle of a vehicle.
     """
 
-    def __init__(self, start: Tuple[float, float, float], goal_line: Tuple[Tuple[float, float], Tuple[float, float]],
-                 bounds: Tuple[float, float, float, float], collision_checker: CollisionChecker,
-                 max_iter: int = 500, step_size: float = 1.0,
-                 max_steering_angle: float = 0.4, wheelbase: float = 1.5,
+    def __init__(self,
+                 start: Tuple[float, float, float],
+                 goal_line: Tuple[Tuple[float, float], Tuple[float, float]],
+                 collision_checker: CollisionChecker,
+                 max_iter: int = 500,
+                 step_size: float = 1.0,
+                 max_steering_angle: float = 0.4,
+                 wheelbase: float = 1.5,
                  sample_radius_centerline: float = 1.4,
                  centerline: Optional[List[Tuple[float, float]]] = None,
                  rrt_targets: Optional[List[Tuple[float, float, float]]] = None):
         """
         Initialize the RRT* planner.
-        
+
         Args:
             start: Starting pose (x, y, theta).
             goal_line: Goal line segment ((x1, y1), (x2, y2)).
@@ -60,69 +74,71 @@ class KinematicRRTStar:
         """
         self.start = Node(start[0], start[1], start[2])
         self.goal_line = goal_line
-        self.bounds = bounds
         self.collision_checker = collision_checker
 
         self.max_iter = max_iter
         self.step_size = step_size
         self.max_steering_angle = max_steering_angle
         self.wheelbase = wheelbase
-        self.centerline = centerline
+        self._inv_wheelbase = 1.0 / wheelbase
+        if centerline is not None:
+            self.centerline = np.array([[pt.x, pt.y] for pt in centerline])
+            self._cl_tree = cKDTree(self.centerline)
+        else:
+            self.centerline = []
+            self._cl_tree = None
         self.rrt_targets = rrt_targets
 
         self.node_list = [self.start]
-        self.sampled_points = []  # Memorizza tutti i punti campionati ad ogni passo
+        self.sampled_points = []  # JUST FOR GRAPHIC DESIGN
         self.sample_radius_centerline = sample_radius_centerline #m
+
+        # Preallocate numpy array for node coordinates to enable vectorized distance checks
+        self.node_coords = np.zeros((self.max_iter + 1, 2))
+        self.node_coords[0] = [self.start.x, self.start.y]
+
+
+
+            # Goal line precomputations
+        a, b = self.goal_line
+        self.ax, self.ay = a
+        self.bx, self.by = b
+        self.goal_dx = self.bx - self.ax
+        self.goal_dy = self.by - self.ay
+        self.goal_len_sq = self.goal_dx * self.goal_dx + self.goal_dy * self.goal_dy
+
+        self.goal_mx = (self.ax + self.bx) / 2.0
+        self.goal_my = (self.ay + self.by) / 2.0
+        self.goal_nx = -self.goal_dy
+        self.goal_ny = self.goal_dx
+        fx = self.goal_mx - self.start.x
+        fy = self.goal_my - self.start.y
+        if (self.goal_nx * fx + self.goal_ny * fy) < 0:
+            self.goal_nx = -self.goal_nx
+            self.goal_ny = -self.goal_ny
+
 
     def _dist_to_goal_line(self, x, y):
         """
         Calculates the shortest distance from a point (x, y) to the goal line segment.
         If the point is past the goal line, it returns 0.0.
         """
-        a, b = self.goal_line
-        ax, ay = a
-        bx, by = b
-        dx = bx - ax
-        dy = by - ay
-
         # 1. Calcola il punto più vicino sul segmento goal_line
-        if dx == 0 and dy == 0:
-            dist_seg = math.hypot(x - ax, y - ay)
+        if self.goal_len_sq == 0:
+            dist_seg = math.hypot(x - self.ax, y - self.ay)
         else:
-            t = ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)
+            t = ((x - self.ax) * self.goal_dx + (y - self.ay) * self.goal_dy) / self.goal_len_sq
             t = max(0.0, min(1.0, t))
-            proj_x = ax + t * dx
-            proj_y = ay + t * dy
+            proj_x = self.ax + t * self.goal_dx
+            proj_y = self.ay + t * self.goal_dy
             dist_seg = math.hypot(x - proj_x, y - proj_y)
 
         # 2. Verifica se il punto ha superato la goal line
-        # Punto medio del traguardo
-        mx = (ax + bx) / 2.0
-        my = (ay + by) / 2.0
-
-        # Vettore dal traguardo al punto
-        wx = x - mx
-        wy = y - my
-
-        # Vettore orientamento goal line (da A a B)
-        ux = bx - ax
-        uy = by - ay
-
-        # Vettore normale provvisorio alla goal line
-        nx = -uy
-        ny = ux
-
-        # Vettore direzione di marcia iniziale (dallo start al midpoint)
-        fx = mx - self.start.x
-        fy = my - self.start.y
-
-        # Allinea la normale nella direzione di marcia
-        if (nx * fx + ny * fy) < 0:
-            nx = -nx
-            ny = -ny
+        wx = x - self.goal_mx
+        wy = y - self.goal_my
 
         # Prodotto scalare per determinare se il punto è oltre la linea
-        is_past = (wx * nx + wy * ny) > 0
+        is_past = (wx * self.goal_nx + wy * self.goal_ny) > 0
 
         if is_past:
             return 0.0
@@ -132,7 +148,7 @@ class KinematicRRTStar:
     def plan(self) -> Optional[Tuple[List[Tuple[float, float, float]], float]]:
         """
         Execute the RRT* planning algorithm.
-        
+
         Returns:
             Tuple of (path, cost) where path is a list of (x, y, theta), or None if no path found.
         """
@@ -144,30 +160,28 @@ class KinematicRRTStar:
             nearest_index = self._get_nearest_node_index(self.node_list, sample)
             nearest_node = self.node_list[nearest_index]
 
-            new_node = self._steer(nearest_node, sample)
+            new_node = self._steer(nearest_node, sample, self.step_size)
 
-            # no reachable
-            if new_node is None:
-                continue
-
-            new_node.parent = nearest_node
+            #new_node.parent = nearest_node
             new_node.cost = self._calc_new_cost(nearest_node, new_node)
             new_node.dist_to_goal = self._dist_to_goal_line(new_node.x, new_node.y)
 
-            # collision check
+            # collision check (fixed list type mismatch)
             if not self.collision_checker.is_path_free(new_node.path):
                 continue
 
             nearest_indeces = self._get_near_nodes(new_node)
-            new_node = self._choose_parent(new_node, nearest_indeces) #update parent, cost and path of the new node
 
+            new_node = self._choose_parent(new_node, nearest_indeces) #update parent, cost and path of the new node
             self.node_list.append(new_node)
+            # Maintain node_coords
+            self.node_coords[len(self.node_list) - 1] = [new_node.x, new_node.y]
 
             # Register as child of parent for efficient cost propagation
             if new_node.parent is not None:
                 new_node.parent.children.append(new_node)
 
-            #self._rewire(new_node, nearest_indeces)
+            self._rewire(new_node, nearest_indeces)
 
 
         # Selezione del percorso migliore
@@ -181,143 +195,79 @@ class KinematicRRTStar:
             # Fallback: se nessuno ha raggiunto il traguardo, prendiamo il più vicino
             best_node = min(self.node_list, key=lambda n: n.dist_to_goal)
 
-        if best_node is not None:
-            return self._extract_path(best_node)
-        else:
-            return None
+        return self._extract_path(best_node)
 
-    #CORRECT
     def _sample_free_space(self) -> Node:
         """
         Randomly sample a point (x, y, theta).
-        If a centerline is provided, strictly sample within a 1.5m radius 
+        If a centerline is provided, strictly sample within a 1.5m radius
         of a randomly chosen point on that centerline.
         Otherwise, sample uniformly within the bounds.
         """
         # Target-biased sampling (comportamento get_random_point_from_target_list)
-        if self.rrt_targets and len(self.rrt_targets) > 0:
-            target_id = random.randint(0, len(self.rrt_targets) - 1)
-            tx, ty, o_size = self.rrt_targets[target_id]
+        #if self.rrt_targets and len(self.rrt_targets) > 0:
+        #    target_id = random.randint(0, len(self.rrt_targets) - 1)
+        #    tx, ty, o_size = self.rrt_targets[target_id]
+        #    rand_angle = random.uniform(0, 2 * math.pi)
+        #    rand_dist = random.uniform(o_size, 3.0)  # maxTargetAroundDist = 3
+        #    x = tx + rand_dist * math.cos(rand_angle)
+        #    y = ty + rand_dist * math.sin(rand_angle)
+        #    theta = random.uniform(-math.pi, math.pi)
+        #    return Node(x, y, theta)
 
-            rand_angle = random.uniform(0, 2 * math.pi)
-            rand_dist = random.uniform(o_size, 3.0)  # maxTargetAroundDist = 3
-            x = tx + rand_dist * math.cos(rand_angle)
-            y = ty + rand_dist * math.sin(rand_angle)
-            theta = random.uniform(-math.pi, math.pi)
-            return Node(x, y, theta)
-
-        if self.centerline and len(self.centerline) > 0:
+        if len(self.centerline) > 0:
             # Pick a random reference segment on the centerline
             i = random.randint(0, len(self.centerline) - 2)
             ref_pt = self.centerline[i]
-            ref_pt2 = self.centerline[i + 1]
 
             # Sample within a circle of radius R around the reference point
             r = self.sample_radius_centerline * math.sqrt(random.uniform(0, 1))  # sqrt for uniform distribution
             alpha = random.uniform(0, 2 * math.pi)
-            x = ref_pt.x + r * math.cos(alpha)
-            y = ref_pt.y + r * math.sin(alpha)
+            x = ref_pt[0] + r * math.cos(alpha)
+            y = ref_pt[1] + r * math.sin(alpha)
 
-            # Local centerline heading: θᵢ = atan2(yᵢ₊₁ - yᵢ, xᵢ₊₁ - xᵢ)
-            theta = math.atan2(ref_pt2.y - ref_pt.y, ref_pt2.x - ref_pt.x)
-            theta = theta + random.uniform(-self.max_steering_angle, self.max_steering_angle)
+            ref_pt2 = self.centerline[i + 1]
+            theta = math.atan2(ref_pt2[1] - ref_pt[1], ref_pt2[0] - ref_pt[0])
             theta = normalize_angle(theta)
             return Node(x, y, theta)
 
         else:
-            x_min, x_max, y_min, y_max = self.bounds
+            x_min, x_max, y_min, y_max = self.collision_checker.xy_limit()
             x = random.uniform(x_min, x_max)
             y = random.uniform(y_min, y_max)
             theta = random.uniform(-math.pi, math.pi)
             return Node(x, y, theta)
 
+    def _steer(self, nearest_node: Node, sample: Node, max_step: float) -> Node:
+        # Calcola la distanza tra nearest_node e sample
+        dist = math.hypot(sample.x - nearest_node.x, sample.y - nearest_node.y)
 
-    def _steer(self, from_node: Node, target: Node) -> Optional[Node]:
-        """
-        Generate a kinematically feasible trajectory from from_node toward to_point
-        using a bicycle model and Pure Pursuit inspired steering.
+        # Limita il passo a max_step
+        step_len = min(dist, max_step)
 
-        Returns:
-            A new Node if a valid motion is generated, otherwise None.
-        """
-        ds = 0.2                       # passo di integrazione [m]
-        goal_tolerance = self.step_size             # distanza per considerare raggiunto il target
+        theta = math.atan2(sample.y - nearest_node.y, sample.x - nearest_node.x)
+        angleChange = normalize_angle(theta - nearest_node.theta)
 
-        x = from_node.x
-        y = from_node.y
-        theta = from_node.theta
+        # Usa l'angolo di sterzo continuo, limitato ai confini fisici max_steering_angle
+        steering_angle = max(-self.max_steering_angle, min(self.max_steering_angle, angleChange))
 
-        cost = from_node.cost
-        travelled = 0.0
-        path = []
+        # Equazioni cinematiche modello bicicletta (asse posteriore) - using cached trig functions
+        x_dot = nearest_node.cos_theta
+        y_dot = nearest_node.sin_theta
+        theta_dot = math.tan(steering_angle) * self._inv_wheelbase
 
-        while travelled < ds:
+        # Integrazione modello discreto — crea Node direttamente con valori finali
+        new_x = nearest_node.x + x_dot * step_len
+        new_y = nearest_node.y + y_dot * step_len
+        new_theta = normalize_angle(nearest_node.theta + theta_dot * step_len)
 
-            # Vettore verso il target
-            dx = target.x - x
-            dy = target.y - y
+        newNode = Node(new_x, new_y, new_theta)
+        newNode.cost = nearest_node.cost + step_len
+        newNode.parent = nearest_node
+        newNode.path = [(new_x, new_y, new_theta)]
 
-            distance = math.hypot(dx, dy)
+        return newNode
 
-            # Se siamo arrivati abbastanza vicini
-            if distance < goal_tolerance:
-                break
-
-            # Direzione verso il target
-            heading = math.atan2(dy, dx)
-
-            # Errore angolare [-pi, pi]
-            alpha = heading - theta
-            alpha = math.atan2(math.sin(alpha), math.cos(alpha))
-
-            # Lookahead
-            Ld = max(distance, 1.0)
-
-            # Curvatura Pure Pursuit
-            kappa = 2.0 * math.sin(alpha) / Ld
-
-            # Steering richiesto
-            delta = math.atan(self.wheelbase * kappa)
-
-            # Saturazione
-            delta = max(
-                -self.max_steering_angle,
-                min(delta, self.max_steering_angle)
-            )
-
-            # Integrazione modello bicycle
-            theta += ds * math.tan(delta) / self.wheelbase
-            theta = normalize_angle(theta)
-
-            x += ds * math.cos(theta)
-            y += ds * math.sin(theta)
-
-            travelled += ds
-
-            # Costo del segmento
-            cost += ds * (1.0 + 0.2 * (kappa ** 2))
-
-            path.append((x, y, theta))
-
-        # Se non siamo riusciti a muoverci
-        if travelled < 1e-3:
-            return None
-
-        new_node = Node(x, y, theta)
-        new_node.parent = from_node
-        new_node.path = path
-        new_node.cost = cost
-
-        return new_node
-
-
-
-    def _propagate_cost_to_children(
-            self,
-            parent_node: Node,
-            old_cost: float,
-            new_cost: float
-    ):
     def _propagate_cost_to_children(self, parent_node: Node, old_cost: float, new_cost: float):
         """
         Propagate cost delta to all descendants using children lists.
@@ -326,11 +276,11 @@ class KinematicRRTStar:
         """
         delta = new_cost - old_cost
 
-        queue = list(parent_node.children)
+        queue = deque(parent_node.children)
         visited = {parent_node}
 
         while queue:
-            node = queue.pop(0)
+            node = queue.popleft()
             if node in visited:
                 # Cycle detected — break it
                 node.parent = None
@@ -345,54 +295,62 @@ class KinematicRRTStar:
     def _calc_new_cost(self, from_node: Node, to_node: Node) -> float:
         """
         Calculate the cost of moving from from_node to to_node.
-        Includes a curvature penalty to encourage straighter paths,
+        Includes a curvature penalty to encourage straighter paths.
         """
-        path_cost = 0.0
         path = to_node.path
         if len(path) > 0:
-
-            # Aggiunge la distanza tra il nodo parent e il primo punto della traiettoria simulata
-            path_cost += math.hypot(from_node.x - path[0][0], from_node.y - path[0][1])
-            # Aggiunge la distanza tra tutti i punti consecutivi
-            for i in range(len(path)-1): # depend on the number of iter in the steer path
-                p1 = path[i]
-                p2 = path[i+1]
-                path_cost += math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+            # Aggiunge la distanza tra il nodo parent e il  punto della traiettoria simulata
+            path_cost = math.hypot(from_node.x - path[0][0], from_node.y - path[0][1])
         else:
-            path_cost += math.hypot(from_node.x - to_node.x, from_node.y - to_node.y)
+            path_cost = math.hypot(from_node.x - to_node.x, from_node.y - to_node.y)
 
-
-        # Centerline Penalty: Heavily penalize deviating from the track center
+        # Centerline curvature Penalty: Heavily penalize deviating from the track center
         cl_penalty = 0.0
-        if self.centerline and len(self.centerline) > 0:
-            ind_near_center_pt = self._get_nearest_node_index(self.centerline, from_node)
+        if self._cl_tree is not None:
+            # KD-tree query O(log n) instead of linear scan
+            _, ind_near_center_pt = self._cl_tree.query([from_node.x, from_node.y])
+
             if ind_near_center_pt == len(self.centerline) - 1:
                 ind_near_center_pt -= 1
-            
+
             p_cl1 = self.centerline[ind_near_center_pt]
             p_cl2 = self.centerline[ind_near_center_pt + 1]
-            
+
             # Centerline vector (from point i to i+1)
-            v_cl_x = p_cl2.x - p_cl1.x
-            v_cl_y = p_cl2.y - p_cl1.y
-            
+            v_cl_x = p_cl2[0] - p_cl1[0]
+            v_cl_y = p_cl2[1] - p_cl1[1]
+
             # Node vector (from from_node to to_node)
             v_node_x = to_node.x - from_node.x
             v_node_y = to_node.y - from_node.y
-            
+
             norm_cl = math.hypot(v_cl_x, v_cl_y)
             norm_node = math.hypot(v_node_x, v_node_y)
-            
+
             if norm_cl > 1e-6 and norm_node > 1e-6:
                 cos_sim = (v_cl_x * v_node_x + v_cl_y * v_node_y) / (norm_cl * norm_node)
             else:
                 cos_sim = 1.0
 
-
             cl_penalty = 1.0 - abs(cos_sim)
 
-        total = from_node.cost + path_cost +  10 * cl_penalty #TODO VALUATE THE PENALTY COEFFICIENT
-        return total
+        # ---THETA BETWEEN NODES PENALTY ---
+        # Kinematic Ratio with
+        dx = to_node.x - from_node.x
+        dy = to_node.y - from_node.y
+        step_len_sq = dx*dx + dy*dy
+        if step_len_sq > 1e-10:
+            delta_theta = abs(normalize_angle(to_node.theta - from_node.theta))
+            # ratio^2 ~= ((delta_theta * wheelbase) / (step_len * max_steering))^2
+            num = delta_theta * self.wheelbase
+            den = self.max_steering_angle
+            steer_ratio_sq = (num * num) / (step_len_sq * den * den)
+            
+            heading_penalty = steer_ratio_sq #* HEADING_WEIGHT
+        else:
+            heading_penalty = 0.0
+
+        return from_node.cost + path_cost + cl_penalty + heading_penalty
 
     def _get_near_nodes(self, new_node: Node) -> List[int]:
         """
@@ -413,14 +371,10 @@ class KinematicRRTStar:
         # Minimum radius to ensure at least some rewiring
         radius = max(radius, self.step_size * 1.5)
 
-        near_indices = []
-        for i in range(n):
-            dist = math.hypot(
-                self.node_list[i].x - new_node.x,
-                self.node_list[i].y - new_node.y
-            )
-            if dist < radius:
-                near_indices.append(i)
+        # NumPy vectorized radius query
+        r_sq = radius * radius
+        dists_sq = (self.node_coords[:n, 0] - new_node.x)**2 + (self.node_coords[:n, 1] - new_node.y)**2
+        near_indices = np.where(dists_sq < r_sq)[0].tolist()
 
         return near_indices
 
@@ -428,15 +382,9 @@ class KinematicRRTStar:
         """
         Find the index of the nearest node in the tree to the sampled point.
         """
-        best= +inf
-        best_index=-1
-        for i in range(len(node_list)):
-            node= node_list[i]
-            dist = math.hypot(node.x-rnd_node.x, node.y-rnd_node.y)
-            if dist < best:
-                best_index = i
-                best=dist
-        return best_index
+        n = len(node_list)
+        dists_sq = (self.node_coords[:n, 0] - rnd_node.x)**2 + (self.node_coords[:n, 1] - rnd_node.y)**2
+        return np.argmin(dists_sq)
 
     def _choose_parent(self, new_node: Node, near_node_indices: List[int]) -> Node:
         """
@@ -454,18 +402,17 @@ class KinematicRRTStar:
             near_node = self.node_list[i]
 
             # Simulate steering from near node to new node
-            #simulated_node = self._steer(near_node, new_node, max_travel=math.inf)
-            simulated_node = self._steer_clothoid(near_node, new_node, max_travel=math.inf)
+            simulated_node = self._steer(near_node, new_node, self.step_size)
 
             if simulated_node is None:
                 continue
 
-            # Se la strada è libera da ostacoli
-            if self.collision_checker.is_path_free(simulated_node.path):
-                # Calcola il potenziale costo se passassimo da questo vicino
-                cost = self._calc_new_cost(near_node, simulated_node)
+            # Calcola il potenziale costo se passassimo da questo vicino
+            cost = self._calc_new_cost(near_node, simulated_node)
 
-                if cost < best_cost:
+            if cost < best_cost:
+                # Collision check solo se il costo è migliorativo
+                if self.collision_checker.is_path_free(simulated_node.path):
                     best_cost = cost
                     best_parent = near_node
                     best_path = simulated_node.path
@@ -481,119 +428,46 @@ class KinematicRRTStar:
 
         return new_node
 
-    def _extract_path(self, last_node: Node):
     def _rewire(self, new_node: Node, near_node_indices: List[int]):
         """
         Rewire nearby nodes through new_node if doing so reduces cost.
-
-        Optimized implementation:
-        - Uses extended _steer reach (max_travel = step_size * 3) for kinematic feasibility
-        - Tight reachability gate (step_size * 1.5) ensures precision
-        - Smoothness bonus: penalizes rewires that create heading discontinuities
-        - Efficient children-based cost propagation
-        - Robust cycle detection with depth limit
         """
-        rewire_reach = self.step_size * 3.0
-
         for i in near_node_indices:
             near_node = self.node_list[i]
 
-            # === FAST REJECTION FILTERS ===
-
-            # Avoid self rewiring
-            if near_node is new_node:
+            # Avoid rewiring the parent of new_node or the start node
+            if near_node is new_node or near_node is new_node.parent or near_node is self.start:
                 continue
 
-            # Don't rewire the root
-            if near_node is self.start:
+            # Calculate distance to near_node
+            dist = math.hypot(near_node.x - new_node.x, near_node.y - new_node.y)
+
+            simulated_node = self._steer(new_node, near_node, dist)
+
+            # Check if simulated_node actually reaches near the target node
+            if math.hypot(simulated_node.x - near_node.x, simulated_node.y - near_node.y) > 0.2:
                 continue
 
-            # Skip if near_node is already a direct parent of new_node
-            if near_node.parent is new_node:
-                continue
-
-            # Skip if new_node is parent of near_node (already optimal link)
-            if new_node.parent is near_node:
-                continue
-
-            # === KINEMATIC FEASIBILITY ===
-
-            # Steer from new_node toward near_node with extended reach
-            #simulated_node = self._steer(new_node, near_node, max_travel=rewire_reach)
-            simulated_node = self._steer_clothoid(new_node, near_node, max_travel=rewire_reach)
-
-            if simulated_node is None:
-                continue
-
-            # Reachability gate: did we actually get close to near_node?
-            reach_dist = math.hypot(
-                simulated_node.x - near_node.x,
-                simulated_node.y - near_node.y
-            )
-            if reach_dist > self.step_size * 1.5:
-                continue
-
-            # === COLLISION CHECK ===
-            if not self.collision_checker.is_path_free(simulated_node.path):
-                continue
-
-            # === CYCLE DETECTION ===
-            # Walk new_node's ancestor chain (with depth limit for safety)
-            is_cycle = False
-            curr = new_node
-            depth = 0
-            max_depth = 200  # prevent infinite loops on corrupted trees
-            while curr is not None and depth < max_depth:
-                if curr is near_node:
-                    is_cycle = True
-                    break
-                curr = curr.parent
-                depth += 1
-            if is_cycle:
-                continue
-
-            # === COST COMPARISON WITH SMOOTHNESS BONUS ===
+            # Calculate potential cost through new_node
             new_cost = self._calc_new_cost(new_node, simulated_node)
 
-            # Smoothness bonus: penalize rewires that create heading discontinuities
-            # This encourages the tree to form smooth, drivable paths
-            if new_node.parent is not None:
-                # Heading from new_node's parent to new_node
-                parent_heading = math.atan2(
-                    new_node.y - new_node.parent.y,
-                    new_node.x - new_node.parent.x
-                )
-                # Heading from new_node to near_node
-                rewire_heading = math.atan2(
-                    near_node.y - new_node.y,
-                    near_node.x - new_node.x
-                )
-                heading_continuity = abs(math.atan2(
-                    math.sin(rewire_heading - parent_heading),
-                    math.cos(rewire_heading - parent_heading)
-                ))
-                # Small penalty for non-smooth connections
-                smoothness_penalty = 0.5 * heading_continuity
-                new_cost += smoothness_penalty
+            if near_node.cost > new_cost:
+                # Collision check
+                if self.collision_checker.is_path_free(simulated_node.path):
+                    # Remove near_node from its current parent's children list
+                    if near_node.parent is not None and near_node in near_node.parent.children:
+                        near_node.parent.children.remove(near_node)
 
-            # Rewire only if cost strictly improves
-            if new_cost < near_node.cost:
-                old_cost = near_node.cost
-
-                # Update children tracking: remove near_node from old parent's children
-                if near_node.parent is not None and near_node in near_node.parent.children:
-                    near_node.parent.children.remove(near_node)
-
-                near_node.parent = new_node
-                near_node.cost = new_cost
-                near_node.path = simulated_node.path
-
-                # Add to new parent's children list
-                if near_node not in new_node.children:
+                    # Update parent, cost, path
+                    old_cost = near_node.cost
+                    near_node.parent = new_node
+                    near_node.cost = new_cost
+                    near_node.path = simulated_node.path
+                    # Add near_node to new_node's children
                     new_node.children.append(near_node)
 
-                # Propagate cost improvement to all descendants
-                self._propagate_cost_to_children(near_node, old_cost, new_cost)
+                    # Propagate cost change to all descendants of near_node
+                    self._propagate_cost_to_children(near_node, old_cost, new_cost)
 
     def _extract_path(self, last_node: Node) -> Tuple[List[Tuple[float, float, float]], float]:
         """
@@ -617,60 +491,69 @@ class KinematicRRTStar:
             dense.extend(node.path)  # (x, y, theta) da _steer
 
         # --- OPZIONI PER IL PATH FINALE ---
-        # Opzione 1 (Attiva): Percorso grezzo puro (nessuno smoothing)
-        return dense, last_node.cost
+        # Opzione 1: Percorso grezzo puro (nessuno smoothing)
+        #return dense, last_node.cost
 
-        # Opzione 2 (Disattivata): Percorso levigato con spline cubica (campionamento equispaziato ad arco)
-        #return self._smooth_path(dense, last_node.cost)
+        # Opzione 2 (Attiva): RRT* + B-spline
+        smoothed_path = self.Bspline(dense)
+        return smoothed_path, last_node.cost
 
-    def _smooth_path(
-            self, path: List[Tuple[float, float, float]], path_cost: float
-    ) -> Tuple[List[Tuple[float, float, float]], float]:
-        import numpy as np
-        from scipy.interpolate import splprep, splev
+    def Bspline(self, path_pts: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+        """
+        Performs B-spline interpolation using chord length parametrization.
+        """
+        if len(path_pts) < 2:
+            return path_pts
 
-        if len(path) < 4:
-            return path, path_cost
+        # Filter out consecutive duplicate points to prevent division by zero in splprep
+        # Optimized to avoid math.hypot square root calls
+        unique_pts = []
+        for p in path_pts:
+            if not unique_pts:
+                unique_pts.append(p)
+            else:
+                last = unique_pts[-1]
+                dx = p[0] - last[0]
+                dy = p[1] - last[1]
+                if dx * dx + dy * dy > 1e-8:
+                    unique_pts.append(p)
 
-        pts = np.array([(p[0], p[1]) for p in path])
+        if len(unique_pts) < 2:
+            return unique_pts
+
+        x = [p[0] for p in unique_pts]
+        y = [p[1] for p in unique_pts]
+
+        # Calculate chord length parametrization (equations 8-11)
+        dists = [0.0]
+        for i in range(1, len(unique_pts)):
+            d = math.hypot(x[i] - x[i-1], y[i] - y[i-1])
+            dists.append(dists[-1] + d)
+
+        total_length = dists[-1]
+        if total_length < 1e-5:
+            return unique_pts
+
+        # Normalize parameters to [0, 1]
+        u = np.array(dists) / total_length
+
+        # Fit B-spline (Paul Dierckx's method)
+        k = min(3, len(unique_pts) - 1)
 
         try:
-            # Fit parametrico della spline
-            tck, u = splprep([pts[:, 0], pts[:, 1]], s=len(path) * 0.5, k=3)
+            tck, u_evaluated = splprep([x, y], u=u, s=len(x) * 0.5, k=k)
+
+            # Generate dense points along the curve (5cm intervals)
+            num_points = max(10, int(total_length / 1)) # between 1 - 2
+            u_new = np.linspace(0.0, 1.0, num_points)
+
+            # Evaluate curve coordinates and first derivatives
+            out_x, out_y = splev(u_new, tck)
+            dx, dy = splev(u_new, tck, der=1)
+
+            thetas = np.arctan2(dy, dx)
+            smoothed_path = list(zip(out_x.tolist(), out_y.tolist(), thetas.tolist()))
+
+            return smoothed_path
         except Exception:
-            return path, path_cost
-
-        # 1. Campioniamo la spline in modo molto denso (1000 punti) per mappare lo spazio
-        u_dense = np.linspace(0.0, 1.0, 1000)
-        x_dense, y_dense = splev(u_dense, tck)
-
-        # 2. Calcoliamo la lunghezza d'arco cumulativa (in metri) lungo i punti densi
-        dx = np.diff(x_dense)
-        dy = np.diff(y_dense)
-        ds = np.hypot(dx, dy)
-        s = np.concatenate([[0.0], np.cumsum(ds)])
-        total_len = s[-1]
-
-        if total_len < 1e-6:
-            return path, path_cost
-
-        # 3. Definiamo la risoluzione desiderata (distanza esatta costante tra i punti, es. 0.2 m)
-        n_out = max(10, int(total_len / self.step_size))
-
-        # 4. Creiamo punti di campionamento perfettamente equispaziati in metri (lunghezza d'arco)
-        s_targets = np.linspace(0.0, total_len, n_out)
-
-        # 5. Interpoliamo le coordinate X e Y basandoci sulla coordinata curvilinea s
-        x_s = np.interp(s_targets, s, x_dense)
-        y_s = np.interp(s_targets, s, y_dense)
-
-        # 6. Calcoliamo l'angolo theta (heading) in modo coerente
-        dx_dt = np.gradient(x_s)
-        dy_dt = np.gradient(y_s)
-        theta_s = np.arctan2(dy_dt, dx_dt)
-
-        smoothed = [(float(x_s[i]), float(y_s[i]), float(theta_s[i])) for i in range(n_out)]
-        if len(smoothed) > 0:
-            # Preserva l'ancoraggio perfetto del punto iniziale
-            smoothed[0] = path[0]
-        return smoothed, path_cost
+            return unique_pts
